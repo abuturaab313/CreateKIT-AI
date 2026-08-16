@@ -1,0 +1,6 @@
+{
+  "name": "CreatorKit AI",
+  "description": "All-in-one AI-powered photo and video utility suite for creators with Enhance, Background Remover, Object Eraser, Compressor, Resize, Thumbnail Maker, Captions, and PDF Converter.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
