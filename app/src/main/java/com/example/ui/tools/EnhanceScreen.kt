@@ -1,12 +1,10 @@
 package com.example.ui.tools
 
-import android.content.Context
-import android.content.Intent
 import android.graphics.Bitmap
 import android.net.Uri
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -40,8 +38,7 @@ import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -68,11 +65,12 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.core.content.FileProvider
 import com.example.data.model.ToolType
 import com.example.engine.AiResult
 import com.example.engine.EnhanceType
-import com.example.engine.ImageProcessor
+import com.example.engine.processor.AppLogger
+import com.example.engine.processor.MediaProcessor
+import com.example.engine.processor.MediaStorageManager
 import com.example.ui.MainViewModel
 import com.example.ui.components.BeforeAfterSlider
 import com.example.ui.components.CreditDialog
@@ -82,11 +80,9 @@ import com.example.ui.components.ProcessingOverlay
 import com.example.ui.theme.DarkSurface
 import com.example.ui.theme.DarkSurfaceElevated
 import com.example.ui.theme.ElectricCyan
-import com.example.ui.theme.NeonAmber
 import com.example.ui.theme.NeonViolet
 import kotlinx.coroutines.launch
 import java.io.File
-import java.io.FileOutputStream
 
 @Composable
 fun EnhanceScreen(
@@ -96,27 +92,34 @@ fun EnhanceScreen(
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
 
-    var selectedUri by remember { mutableStateOf<Uri?>(null) }
+    var selectedInputUri by remember { mutableStateOf<Uri?>(null) }
     var originalBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var enhancedBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var selectedMode by remember { mutableStateOf(EnhanceType.AUTO) }
 
     var isProcessing by remember { mutableStateOf(false) }
+    var isSaving by remember { mutableStateOf(false) }
     var progressVal by remember { mutableFloatStateOf(0f) }
     var statusText by remember { mutableStateOf("") }
     var errorMessage by remember { mutableStateOf<String?>(null) }
     var showCreditDialog by remember { mutableStateOf(false) }
+    var lastSavedFile by remember { mutableStateOf<File?>(null) }
     var savedSuccess by remember { mutableStateOf(false) }
+    var saveError by remember { mutableStateOf<String?>(null) }
 
     val photoPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
     ) { uri: Uri? ->
         if (uri != null) {
-            selectedUri = uri
+            selectedInputUri = uri
             errorMessage = null
             enhancedBitmap = null
+            lastSavedFile = null
             savedSuccess = false
-            originalBitmap = ImageProcessor.loadBitmapFromUri(context, uri, 1920)
+            saveError = null
+            val inputSize = MediaProcessor.image.getFileSizeFromUri(context, uri)
+            AppLogger.logStart("AiEnhance", uri.toString(), context.contentResolver.getType(uri), inputSize)
+            originalBitmap = MediaProcessor.image.loadBitmapFromUri(context, uri, 1920)
         }
     }
 
@@ -130,9 +133,10 @@ fun EnhanceScreen(
         isProcessing = true
         errorMessage = null
         progressVal = 0.1f
-        statusText = "Initializing AI model..."
+        statusText = "Processing enhancement..."
 
         scope.launch {
+            AppLogger.logProcessing("AiEnhance", "MediaProcessor.image.enhance", selectedMode.displayName)
             val result = viewModel.cloudAiClient.enhanceImageWithAi(bmp, selectedMode) { p, stage ->
                 progressVal = p
                 statusText = stage
@@ -142,43 +146,68 @@ fun EnhanceScreen(
             when (result) {
                 is AiResult.Success -> {
                     enhancedBitmap = result.data
+                    savedSuccess = false
+                    saveError = null
+                    AppLogger.logSuccess("AiEnhance", "Engine: ${result.modelName}, Latency: ${result.latencyMs}ms")
                 }
                 is AiResult.Error -> {
                     errorMessage = result.message
+                    AppLogger.logFailed("AiEnhance", RuntimeException(result.message))
                 }
             }
         }
     }
 
-    fun saveAndShare(share: Boolean = false) {
+    fun performSave(onComplete: ((File?) -> Unit)? = null) {
         val result = enhancedBitmap ?: return
+        isSaving = true
+        saveError = null
+
         scope.launch {
-            val exportDir = File(context.filesDir, "exports").apply { mkdirs() }
-            val exportFile = File(exportDir, "enhanced_${System.currentTimeMillis()}.jpg")
-            val fos = FileOutputStream(exportFile)
-            result.compress(Bitmap.CompressFormat.JPEG, 95, fos)
-            fos.flush()
-            fos.close()
-
-            viewModel.saveProject(
-                title = "Enhanced (${selectedMode.displayName})",
-                tool = ToolType.AI_ENHANCE,
-                outputFile = exportFile,
-                previewBitmap = result,
-                width = result.width,
-                height = result.height,
-                format = "JPG"
+            val title = "enhanced_${selectedMode.name.lowercase()}_${System.currentTimeMillis()}"
+            val saveResult = MediaStorageManager.saveBitmapToGallery(
+                context = context,
+                bitmap = result,
+                displayName = title,
+                format = Bitmap.CompressFormat.JPEG,
+                quality = 95
             )
-            savedSuccess = true
 
-            if (share) {
-                val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", exportFile)
-                val intent = Intent(Intent.ACTION_SEND).apply {
-                    type = "image/jpeg"
-                    putExtra(Intent.EXTRA_STREAM, uri)
-                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            if (saveResult.isSuccess) {
+                val (file, galleryUri) = saveResult.getOrThrow()
+                lastSavedFile = file
+                viewModel.saveProject(
+                    title = "Enhanced (${selectedMode.displayName})",
+                    tool = ToolType.AI_ENHANCE,
+                    outputFile = file,
+                    previewBitmap = result,
+                    width = result.width,
+                    height = result.height,
+                    format = "JPG"
+                )
+                savedSuccess = true
+                isSaving = false
+                Toast.makeText(context, "Saved to Gallery!", Toast.LENGTH_SHORT).show()
+                onComplete?.invoke(file)
+            } else {
+                val err = saveResult.exceptionOrNull()?.localizedMessage ?: "Failed to save image"
+                saveError = err
+                isSaving = false
+                Toast.makeText(context, "Save failed: $err", Toast.LENGTH_SHORT).show()
+                onComplete?.invoke(null)
+            }
+        }
+    }
+
+    fun performShare() {
+        val cachedFile = lastSavedFile
+        if (cachedFile != null && cachedFile.exists()) {
+            MediaStorageManager.shareMediaFile(context, cachedFile, "image/jpeg", "Share Enhanced Photo")
+        } else {
+            performSave { file ->
+                if (file != null && file.exists()) {
+                    MediaStorageManager.shareMediaFile(context, file, "image/jpeg", "Share Enhanced Photo")
                 }
-                context.startActivity(Intent.createChooser(intent, "Share Enhanced Photo"))
             }
         }
     }
@@ -240,7 +269,6 @@ fun EnhanceScreen(
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
                 if (originalBitmap == null) {
-                    // Upload Placeholder Box
                     GlassCard(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -290,11 +318,12 @@ fun EnhanceScreen(
                         }
                     }
                 } else {
-                    // Preview Area (Before/After Slider if enhanced, or Original)
+                    // Preview Area with Before/After Slider
+                    val aspect = (originalBitmap!!.width.toFloat() / originalBitmap!!.height.coerceAtLeast(1).toFloat()).coerceIn(0.6f, 2.2f)
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .aspectRatio(4f / 3f)
+                            .aspectRatio(aspect)
                             .clip(RoundedCornerShape(20.dp))
                             .background(DarkSurface)
                     ) {
@@ -343,7 +372,10 @@ fun EnhanceScreen(
                                 ),
                                 modifier = Modifier
                                     .clip(RoundedCornerShape(14.dp))
-                                    .clickable { selectedMode = mode }
+                                    .clickable {
+                                        selectedMode = mode
+                                        enhancedBitmap = null
+                                    }
                                     .testTag("enhance_mode_${mode.name}")
                             ) {
                                 Row(
@@ -379,6 +411,16 @@ fun EnhanceScreen(
                         modifier = Modifier.align(Alignment.Start)
                     )
 
+                    if (saveError != null) {
+                        Spacer(modifier = Modifier.height(14.dp))
+                        Text(
+                            text = "Save failed: $saveError",
+                            color = Color(0xFFFF5252),
+                            fontSize = 13.sp,
+                            textAlign = TextAlign.Center
+                        )
+                    }
+
                     Spacer(modifier = Modifier.height(24.dp))
 
                     // Error Banner if failed
@@ -386,8 +428,7 @@ fun EnhanceScreen(
                         ErrorStateCard(
                             errorMessage = errorMessage!!,
                             onRetry = { startEnhance() },
-                            onCancel = { errorMessage = null },
-                            onReportProblem = { /* Open support */ }
+                            onCancel = { errorMessage = null }
                         )
                         Spacer(modifier = Modifier.height(16.dp))
                     }
@@ -396,6 +437,7 @@ fun EnhanceScreen(
                     if (enhancedBitmap == null) {
                         Button(
                             onClick = { startEnhance() },
+                            enabled = !isProcessing,
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .height(54.dp)
@@ -411,7 +453,7 @@ fun EnhanceScreen(
                             )
                             Spacer(modifier = Modifier.width(8.dp))
                             Text(
-                                text = "Enhance with AI (1 Credit)",
+                                text = "Enhance with AI",
                                 fontSize = 15.sp,
                                 fontWeight = FontWeight.Bold,
                                 color = Color.Black
@@ -434,7 +476,8 @@ fun EnhanceScreen(
                             }
 
                             Button(
-                                onClick = { saveAndShare(share = false) },
+                                onClick = { performSave() },
+                                enabled = !isSaving,
                                 modifier = Modifier
                                     .weight(1f)
                                     .height(52.dp)
@@ -442,25 +485,31 @@ fun EnhanceScreen(
                                 shape = RoundedCornerShape(14.dp),
                                 colors = ButtonDefaults.buttonColors(containerColor = ElectricCyan)
                             ) {
-                                Icon(
-                                    imageVector = if (savedSuccess) Icons.Default.Check else Icons.Default.Download,
-                                    contentDescription = null,
-                                    tint = Color.Black,
-                                    modifier = Modifier.size(18.dp)
-                                )
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text(
-                                    text = if (savedSuccess) "Saved!" else "Save Project",
-                                    color = Color.Black,
-                                    fontWeight = FontWeight.Bold
-                                )
+                                if (isSaving) {
+                                    CircularProgressIndicator(color = Color.Black, modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text("Saving...", color = Color.Black, fontWeight = FontWeight.Bold)
+                                } else {
+                                    Icon(
+                                        imageVector = if (savedSuccess) Icons.Default.Check else Icons.Default.Download,
+                                        contentDescription = null,
+                                        tint = Color.Black,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(
+                                        text = if (savedSuccess) "Saved!" else "Save to Gallery",
+                                        color = Color.Black,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
                             }
                         }
 
                         Spacer(modifier = Modifier.height(12.dp))
 
                         Button(
-                            onClick = { saveAndShare(share = true) },
+                            onClick = { performShare() },
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .height(52.dp)
@@ -475,7 +524,7 @@ fun EnhanceScreen(
                                 modifier = Modifier.size(18.dp)
                             )
                             Spacer(modifier = Modifier.width(8.dp))
-                            Text("Share to Social Media", color = Color.White, fontWeight = FontWeight.Bold)
+                            Text("Share Enhanced Photo", color = Color.White, fontWeight = FontWeight.Bold)
                         }
                     }
                 }

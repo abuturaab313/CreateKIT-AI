@@ -1,7 +1,7 @@
 package com.example.ui.tools
 
-import android.content.Intent
 import android.net.Uri
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
@@ -50,7 +50,6 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -67,11 +66,12 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.core.content.FileProvider
 import com.example.data.model.ToolType
 import com.example.engine.VideoInfo
 import com.example.engine.VideoPreset
+import com.example.engine.processor.AppLogger
 import com.example.engine.processor.MediaProcessor
+import com.example.engine.processor.MediaStorageManager
 import com.example.engine.processor.RealVideoProcessResult
 import com.example.ui.MainViewModel
 import com.example.ui.components.GlassCard
@@ -97,9 +97,11 @@ fun VideoCompressorScreen(
 
     var trimRange by remember { mutableStateOf(0f..10f) }
     var isProcessing by remember { mutableStateOf(false) }
+    var isSaving by remember { mutableStateOf(false) }
     var processResult by remember { mutableStateOf<RealVideoProcessResult?>(null) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
     var savedSuccess by remember { mutableStateOf(false) }
+    var saveError by remember { mutableStateOf<String?>(null) }
 
     val videoPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
@@ -109,21 +111,14 @@ fun VideoCompressorScreen(
             processResult = null
             savedSuccess = false
             errorMessage = null
+            saveError = null
             val info = MediaProcessor.video.inspect(context, uri)
             videoInfo = info
             if (info != null) {
                 val durSec = (info.durationMs / 1000f).coerceAtLeast(1f)
                 trimRange = 0f..durSec
+                AppLogger.logStart("VideoCompressor", uri.toString(), "video/mp4", info.fileSizeBytes)
             }
-        }
-    }
-
-    fun formatBytes(bytes: Long): String {
-        return when {
-            bytes >= 1024 * 1024 * 1024 -> String.format("%.2f GB", bytes / (1024f * 1024f * 1024f))
-            bytes >= 1024 * 1024 -> String.format("%.1f MB", bytes / (1024f * 1024f))
-            bytes >= 1024 -> String.format("%.1f KB", bytes / 1024f)
-            else -> "$bytes B"
         }
     }
 
@@ -140,6 +135,8 @@ fun VideoCompressorScreen(
 
         isProcessing = true
         errorMessage = null
+        saveError = null
+        savedSuccess = false
 
         scope.launch {
             try {
@@ -149,6 +146,7 @@ fun VideoCompressorScreen(
                 val startMs = (trimRange.start * 1000).toLong().coerceAtLeast(0L)
                 val endMs = (trimRange.endInclusive * 1000).toLong().coerceAtMost(info.durationMs)
 
+                AppLogger.logProcessing("VideoCompressor", "MediaProcessor.video.trimVideo", "from ${startMs}ms to ${endMs}ms")
                 val result = MediaProcessor.video.trimVideo(
                     context = context,
                     srcUri = uri,
@@ -159,36 +157,69 @@ fun VideoCompressorScreen(
 
                 processResult = result
                 isProcessing = false
+                AppLogger.logSuccess("VideoCompressor", "Exported ${AppLogger.formatBytes(result.outputSizeBytes)} (${result.outputDurationMs}ms)")
             } catch (e: Exception) {
                 isProcessing = false
+                AppLogger.logFailed("VideoCompressor", e)
                 errorMessage = "Video processing failed: ${e.localizedMessage ?: "Format not supported"}"
             }
         }
     }
 
-    fun saveToProjects(share: Boolean = false) {
+    fun saveToGallery(onComplete: ((File?) -> Unit)? = null) {
         val result = processResult ?: return
-        scope.launch {
-            viewModel.saveProject(
-                title = "Trimmed Video (${result.width}×${result.height})",
-                tool = ToolType.VIDEO_COMPRESSOR,
-                outputFile = result.file,
-                previewBitmap = videoInfo?.thumbnail,
-                width = result.width,
-                height = result.height,
-                format = "MP4"
-            )
-            savedSuccess = true
+        isSaving = true
+        saveError = null
 
-            if (share) {
-                val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", result.file)
-                val intent = Intent(Intent.ACTION_SEND).apply {
-                    type = "video/mp4"
-                    putExtra(Intent.EXTRA_STREAM, uri)
-                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        scope.launch {
+            try {
+                val saveRes = MediaStorageManager.saveVideoToGallery(
+                    context = context,
+                    sourceVideoFile = result.file,
+                    displayName = result.file.name,
+                    mimeType = "video/mp4"
+                )
+
+                if (saveRes.isSuccess) {
+                    viewModel.saveProject(
+                        title = "Trimmed Video (${result.width}×${result.height})",
+                        tool = ToolType.VIDEO_COMPRESSOR,
+                        outputFile = result.file,
+                        previewBitmap = videoInfo?.thumbnail,
+                        width = result.width,
+                        height = result.height,
+                        format = "MP4"
+                    )
+                    savedSuccess = true
+                    isSaving = false
+                    Toast.makeText(context, "Saved to Videos Gallery!", Toast.LENGTH_SHORT).show()
+                    onComplete?.invoke(result.file)
+                } else {
+                    val err = saveRes.exceptionOrNull()?.localizedMessage ?: "Failed to save video"
+                    saveError = err
+                    isSaving = false
+                    Toast.makeText(context, "Save failed: $err", Toast.LENGTH_SHORT).show()
+                    onComplete?.invoke(null)
                 }
-                context.startActivity(Intent.createChooser(intent, "Share Trimmed Video"))
+            } catch (e: Exception) {
+                isSaving = false
+                saveError = e.localizedMessage
+                AppLogger.logFailed("SaveVideoToGallery", e)
+                Toast.makeText(context, "Save error: ${e.localizedMessage}", Toast.LENGTH_SHORT).show()
+                onComplete?.invoke(null)
             }
+        }
+    }
+
+    fun performShare() {
+        val result = processResult
+        if (result != null && result.file.exists()) {
+            MediaStorageManager.shareMediaFile(
+                context = context,
+                file = result.file,
+                mimeType = "video/mp4",
+                chooserTitle = "Share Trimmed Video"
+            )
         }
     }
 
@@ -368,7 +399,11 @@ fun VideoCompressorScreen(
 
                             RangeSlider(
                                 value = trimRange,
-                                onValueChange = { trimRange = it },
+                                onValueChange = {
+                                    trimRange = it
+                                    processResult = null
+                                    savedSuccess = false
+                                },
                                 valueRange = 0f..maxSec,
                                 colors = SliderDefaults.colors(
                                     thumbColor = ElectricCyan,
@@ -399,7 +434,7 @@ fun VideoCompressorScreen(
                                 ) {
                                     Column {
                                         Text("OUTPUT FILE READY", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = NeonEmerald)
-                                        Text(formatBytes(res.outputSizeBytes), fontSize = 22.sp, fontWeight = FontWeight.Black, color = Color.White)
+                                        Text(AppLogger.formatBytes(res.outputSizeBytes), fontSize = 22.sp, fontWeight = FontWeight.Black, color = Color.White)
                                         Text("Duration: ${formatSeconds(res.outputDurationMs / 1000f)}", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                     }
                                     Surface(
@@ -419,6 +454,16 @@ fun VideoCompressorScreen(
                             }
                         }
 
+                        if (saveError != null) {
+                            Spacer(modifier = Modifier.height(12.dp))
+                            Text(
+                                text = "Save failed: $saveError",
+                                color = Color(0xFFFF5252),
+                                fontSize = 13.sp,
+                                textAlign = TextAlign.Center
+                            )
+                        }
+
                         Spacer(modifier = Modifier.height(16.dp))
 
                         Row(
@@ -426,7 +471,8 @@ fun VideoCompressorScreen(
                             horizontalArrangement = Arrangement.spacedBy(10.dp)
                         ) {
                             Button(
-                                onClick = { saveToProjects(share = false) },
+                                onClick = { saveToGallery() },
+                                enabled = !isSaving,
                                 modifier = Modifier
                                     .weight(1f)
                                     .height(52.dp)
@@ -434,22 +480,28 @@ fun VideoCompressorScreen(
                                 shape = RoundedCornerShape(14.dp),
                                 colors = ButtonDefaults.buttonColors(containerColor = NeonEmerald)
                             ) {
-                                Icon(
-                                    imageVector = if (savedSuccess) Icons.Default.Check else Icons.Default.Download,
-                                    contentDescription = null,
-                                    tint = Color.Black,
-                                    modifier = Modifier.size(18.dp)
-                                )
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text(
-                                    text = if (savedSuccess) "Saved!" else "Save Project",
-                                    color = Color.Black,
-                                    fontWeight = FontWeight.Bold
-                                )
+                                if (isSaving) {
+                                    CircularProgressIndicator(color = Color.Black, modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text("Saving...", color = Color.Black, fontWeight = FontWeight.Bold)
+                                } else {
+                                    Icon(
+                                        imageVector = if (savedSuccess) Icons.Default.Check else Icons.Default.Download,
+                                        contentDescription = null,
+                                        tint = Color.Black,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(
+                                        text = if (savedSuccess) "Saved!" else "Save to Gallery",
+                                        color = Color.Black,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
                             }
 
                             Button(
-                                onClick = { saveToProjects(share = true) },
+                                onClick = { performShare() },
                                 modifier = Modifier
                                     .weight(1f)
                                     .height(52.dp)

@@ -1,14 +1,14 @@
 package com.example.ui.tools
 
-import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Color as AndroidColor
 import android.net.Uri
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -34,15 +34,12 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AddPhotoAlternate
-import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Check
-import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Download
-import androidx.compose.material.icons.filled.FormatPaint
 import androidx.compose.material.icons.filled.Share
-import androidx.compose.material.icons.filled.TextFields
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -59,7 +56,6 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -76,15 +72,15 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.core.content.FileProvider
 import com.example.data.model.ToolType
-import com.example.engine.ImageProcessor
 import com.example.engine.ShapeLayer
-import com.example.engine.ShapeType
 import com.example.engine.StickerLayer
 import com.example.engine.TextLayer
 import com.example.engine.ThumbnailEngine
 import com.example.engine.ThumbnailTemplate
+import com.example.engine.processor.AppLogger
+import com.example.engine.processor.MediaProcessor
+import com.example.engine.processor.MediaStorageManager
 import com.example.ui.MainViewModel
 import com.example.ui.theme.DarkSurface
 import com.example.ui.theme.DarkSurfaceElevated
@@ -123,22 +119,30 @@ fun ThumbnailMakerScreen(
     }
 
     var renderedPreview by remember { mutableStateOf<Bitmap?>(null) }
-    var activeTab by remember { mutableStateOf("templates") } // templates, text, stickers, background
+    var activeTab by remember { mutableStateOf("templates") }
     var selectedTextIndex by remember { mutableStateOf(0) }
+    var isSaving by remember { mutableStateOf(false) }
     var savedSuccess by remember { mutableStateOf(false) }
+    var saveError by remember { mutableStateOf<String?>(null) }
+    var lastExportedFile by remember { mutableStateOf<File?>(null) }
 
     fun refreshPreview() {
-        val tempFile = File(context.cacheDir, "thumb_preview.png")
-        ThumbnailEngine.renderThumbnail(
-            bgBitmap = bgBitmap,
-            bgGradientStart = bgGradStart,
-            bgGradientEnd = bgGradEnd,
-            textLayers = textLayers.toList(),
-            stickers = stickerLayers.toList(),
-            shapes = shapeLayers.toList(),
-            outputFile = tempFile
-        )
-        renderedPreview = ImageProcessor.loadBitmapFromUri(context, Uri.fromFile(tempFile), 1280)
+        try {
+            val tempFile = File(context.cacheDir, "thumb_preview.png")
+            ThumbnailEngine.renderThumbnail(
+                bgBitmap = bgBitmap,
+                bgGradientStart = bgGradStart,
+                bgGradientEnd = bgGradEnd,
+                textLayers = textLayers.toList(),
+                stickers = stickerLayers.toList(),
+                shapes = shapeLayers.toList(),
+                outputFile = tempFile
+            )
+            renderedPreview = MediaProcessor.image.loadBitmapFromUri(context, Uri.fromFile(tempFile), 1280)
+            savedSuccess = false
+        } catch (e: Exception) {
+            AppLogger.logFailed("ThumbnailMaker_refreshPreview", e)
+        }
     }
 
     LaunchedEffect(Unit) {
@@ -149,7 +153,7 @@ fun ThumbnailMakerScreen(
         contract = ActivityResultContracts.GetContent()
     ) { uri: Uri? ->
         if (uri != null) {
-            bgBitmap = ImageProcessor.loadBitmapFromUri(context, uri, 1920)
+            bgBitmap = MediaProcessor.image.loadBitmapFromUri(context, uri, 1920)
             refreshPreview()
         }
     }
@@ -167,40 +171,85 @@ fun ThumbnailMakerScreen(
         refreshPreview()
     }
 
-    fun saveAndShare(share: Boolean = false) {
+    fun exportAndSave(onComplete: ((File?) -> Unit)? = null) {
+        isSaving = true
+        saveError = null
+
         scope.launch {
-            val exportDir = File(context.filesDir, "exports").apply { mkdirs() }
-            val exportFile = File(exportDir, "thumbnail_1280x720_${System.currentTimeMillis()}.png")
+            try {
+                val exportDir = MediaProcessor.getExportDirectory(context)
+                val exportFile = File(exportDir, "thumbnail_1280x720_${System.currentTimeMillis()}.png")
 
-            ThumbnailEngine.renderThumbnail(
-                bgBitmap = bgBitmap,
-                bgGradientStart = bgGradStart,
-                bgGradientEnd = bgGradEnd,
-                textLayers = textLayers.toList(),
-                stickers = stickerLayers.toList(),
-                shapes = shapeLayers.toList(),
-                outputFile = exportFile
-            )
+                AppLogger.logProcessing("ThumbnailMaker", "renderThumbnail", "1280x720 PNG")
+                ThumbnailEngine.renderThumbnail(
+                    bgBitmap = bgBitmap,
+                    bgGradientStart = bgGradStart,
+                    bgGradientEnd = bgGradEnd,
+                    textLayers = textLayers.toList(),
+                    stickers = stickerLayers.toList(),
+                    shapes = shapeLayers.toList(),
+                    outputFile = exportFile
+                )
 
-            viewModel.saveProject(
-                title = "YouTube Thumbnail (1280×720)",
-                tool = ToolType.THUMBNAIL_MAKER,
-                outputFile = exportFile,
-                previewBitmap = renderedPreview,
-                width = 1280,
-                height = 720,
-                format = "PNG"
-            )
-            savedSuccess = true
+                lastExportedFile = exportFile
 
-            if (share) {
-                val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", exportFile)
-                val intent = Intent(Intent.ACTION_SEND).apply {
-                    type = "image/png"
-                    putExtra(Intent.EXTRA_STREAM, uri)
-                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                val saveResult = MediaStorageManager.saveImageToGallery(
+                    context = context,
+                    sourceFile = exportFile,
+                    displayName = exportFile.name,
+                    mimeType = "image/png"
+                )
+
+                if (saveResult.isSuccess) {
+                    viewModel.saveProject(
+                        title = "YouTube Thumbnail (1280×720)",
+                        tool = ToolType.THUMBNAIL_MAKER,
+                        outputFile = exportFile,
+                        previewBitmap = renderedPreview,
+                        width = 1280,
+                        height = 720,
+                        format = "PNG"
+                    )
+                    savedSuccess = true
+                    isSaving = false
+                    AppLogger.logSuccess("ThumbnailMaker", "Saved to gallery (${AppLogger.formatBytes(exportFile.length())})")
+                    Toast.makeText(context, "Saved to Gallery!", Toast.LENGTH_SHORT).show()
+                    onComplete?.invoke(exportFile)
+                } else {
+                    val err = saveResult.exceptionOrNull()?.localizedMessage ?: "Failed to save thumbnail"
+                    saveError = err
+                    isSaving = false
+                    Toast.makeText(context, "Save failed: $err", Toast.LENGTH_SHORT).show()
+                    onComplete?.invoke(null)
                 }
-                context.startActivity(Intent.createChooser(intent, "Share YouTube Thumbnail"))
+            } catch (e: Exception) {
+                isSaving = false
+                saveError = e.localizedMessage
+                AppLogger.logFailed("ThumbnailMaker", e)
+                Toast.makeText(context, "Error: ${e.localizedMessage}", Toast.LENGTH_SHORT).show()
+                onComplete?.invoke(null)
+            }
+        }
+    }
+
+    fun performShare() {
+        if (lastExportedFile != null && lastExportedFile!!.exists()) {
+            MediaStorageManager.shareMediaFile(
+                context = context,
+                file = lastExportedFile!!,
+                mimeType = "image/png",
+                chooserTitle = "Share YouTube Thumbnail"
+            )
+        } else {
+            exportAndSave { file ->
+                if (file != null) {
+                    MediaStorageManager.shareMediaFile(
+                        context = context,
+                        file = file,
+                        mimeType = "image/png",
+                        chooserTitle = "Share YouTube Thumbnail"
+                    )
+                }
             }
         }
     }
@@ -249,7 +298,7 @@ fun ThumbnailMakerScreen(
                 Surface(
                     shape = RoundedCornerShape(8.dp),
                     color = NeonAmber.copy(alpha = 0.2f),
-                    border = androidx.compose.foundation.BorderStroke(1.dp, NeonAmber)
+                    border = BorderStroke(1.dp, NeonAmber)
                 ) {
                     Text(
                         text = "1280 × 720 HD",
@@ -342,7 +391,7 @@ fun ThumbnailMakerScreen(
                                 Surface(
                                     shape = RoundedCornerShape(14.dp),
                                     color = DarkSurfaceElevated,
-                                    border = androidx.compose.foundation.BorderStroke(1.dp, Color(template.category.badgeColor).copy(alpha = 0.5f)),
+                                    border = BorderStroke(1.dp, Color(template.category.badgeColor).copy(alpha = 0.5f)),
                                     modifier = Modifier
                                         .width(150.dp)
                                         .clip(RoundedCornerShape(14.dp))
@@ -605,22 +654,34 @@ fun ThumbnailMakerScreen(
                     }
                 }
 
+                if (saveError != null) {
+                    Spacer(modifier = Modifier.height(14.dp))
+                    Text(
+                        text = "Save failed: $saveError",
+                        color = Color(0xFFFF5252),
+                        fontSize = 13.sp,
+                        textAlign = TextAlign.Center
+                    )
+                }
+
                 Spacer(modifier = Modifier.height(24.dp))
 
                 // Action Buttons
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                Button(
+                    onClick = { exportAndSave() },
+                    enabled = !isSaving,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(52.dp)
+                        .testTag("save_thumbnail_button"),
+                    shape = RoundedCornerShape(14.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = ElectricCyan)
                 ) {
-                    Button(
-                        onClick = { saveAndShare(share = false) },
-                        modifier = Modifier
-                            .weight(1f)
-                            .height(52.dp)
-                            .testTag("save_thumbnail_button"),
-                        shape = RoundedCornerShape(14.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = ElectricCyan)
-                    ) {
+                    if (isSaving) {
+                        CircularProgressIndicator(color = Color.Black, modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Saving...", color = Color.Black, fontWeight = FontWeight.Bold)
+                    } else {
                         Icon(
                             imageVector = if (savedSuccess) Icons.Default.Check else Icons.Default.Download,
                             contentDescription = null,
@@ -639,7 +700,7 @@ fun ThumbnailMakerScreen(
                 Spacer(modifier = Modifier.height(12.dp))
 
                 Button(
-                    onClick = { saveAndShare(share = true) },
+                    onClick = { performShare() },
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(52.dp),

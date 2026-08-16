@@ -1,10 +1,11 @@
 package com.example.ui.tools
 
-import android.content.Intent
 import android.graphics.Bitmap
 import android.net.Uri
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -28,13 +29,13 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.filled.AddPhotoAlternate
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Compress
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -63,33 +64,32 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.core.content.FileProvider
 import com.example.data.model.ToolType
 import com.example.engine.CompressionResult
 import com.example.engine.ImageProcessor
+import com.example.engine.processor.AppLogger
 import com.example.engine.processor.MediaProcessor
+import com.example.engine.processor.MediaStorageManager
 import com.example.ui.MainViewModel
 import com.example.ui.components.GlassCard
 import com.example.ui.theme.DarkSurface
 import com.example.ui.theme.DarkSurfaceElevated
 import com.example.ui.theme.ElectricCyan
-import com.example.ui.theme.NeonAmber
 import com.example.ui.theme.NeonEmerald
 import com.example.ui.theme.NeonViolet
 import kotlinx.coroutines.launch
 import java.io.File
 
 enum class CompressPreset(val label: String, val quality: Int, val maxDim: Int) {
-    MAX_QUALITY("Max Quality", 92, 3840),
-    BALANCED("Balanced", 78, 1920),
-    WEB_OPTIMIZED("Web & Social", 65, 1440),
-    SMALL_FILE("Small File", 45, 1080)
+    MAX_QUALITY("High Quality", 90, 3840),
+    BALANCED("Balanced", 75, 2048),
+    MAX_COMPRESSION("Smallest Size", 50, 1280)
 }
 
-enum class OutputFormat(val label: String, val ext: String, val format: Bitmap.CompressFormat) {
-    WEBP("WEBP", "webp", Bitmap.CompressFormat.WEBP),
-    JPG("JPG", "jpg", Bitmap.CompressFormat.JPEG),
-    PNG("PNG", "png", Bitmap.CompressFormat.PNG)
+enum class OutputFormat(val label: String, val ext: String, val mime: String, val format: Bitmap.CompressFormat) {
+    WEBP("WEBP", "webp", "image/webp", Bitmap.CompressFormat.WEBP),
+    JPG("JPG", "jpg", "image/jpeg", Bitmap.CompressFormat.JPEG),
+    PNG("PNG", "png", "image/png", Bitmap.CompressFormat.PNG)
 }
 
 @Composable
@@ -100,6 +100,7 @@ fun CompressScreen(
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
 
+    var selectedInputUri by remember { mutableStateOf<Uri?>(null) }
     var originalBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var originalSizeBytes by remember { mutableStateOf(0L) }
     var selectedPreset by remember { mutableStateOf(CompressPreset.BALANCED) }
@@ -108,77 +109,119 @@ fun CompressScreen(
 
     var compressionResult by remember { mutableStateOf<CompressionResult?>(null) }
     var isProcessing by remember { mutableStateOf(false) }
+    var isSaving by remember { mutableStateOf(false) }
     var savedSuccess by remember { mutableStateOf(false) }
+    var saveError by remember { mutableStateOf<String?>(null) }
 
     val photoPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
     ) { uri: Uri? ->
         if (uri != null) {
+            selectedInputUri = uri
             compressionResult = null
             savedSuccess = false
+            saveError = null
             originalSizeBytes = MediaProcessor.image.getFileSizeFromUri(context, uri)
+            AppLogger.logStart("CompressImage", uri.toString(), context.contentResolver.getType(uri), originalSizeBytes)
             originalBitmap = MediaProcessor.image.loadBitmapFromUri(context, uri, 3840)
         }
     }
 
-    fun formatBytes(bytes: Long): String {
-        return when {
-            bytes >= 1024 * 1024 -> String.format("%.2f MB", bytes / (1024f * 1024f))
-            bytes >= 1024 -> String.format("%.1f KB", bytes / 1024f)
-            else -> "$bytes B"
-        }
-    }
+    fun formatBytes(bytes: Long): String = AppLogger.formatBytes(bytes)
 
     fun startCompress() {
         val src = originalBitmap ?: return
         isProcessing = true
+        saveError = null
+        savedSuccess = false
+
         scope.launch {
-            val exportDir = File(context.filesDir, "exports").apply { mkdirs() }
-            val exportFile = File(exportDir, "compressed_${System.currentTimeMillis()}.${selectedFormat.ext}")
+            try {
+                val exportDir = MediaProcessor.getExportDirectory(context)
+                val exportFile = File(exportDir, "compressed_${System.currentTimeMillis()}.${selectedFormat.ext}")
 
-            val result = ImageProcessor.compressImage(
-                src = src,
-                format = selectedFormat.format,
-                quality = qualityVal.toInt(),
-                maxWidth = selectedPreset.maxDim,
-                maxHeight = selectedPreset.maxDim,
-                destFile = exportFile,
-                originalSizeBytes = originalSizeBytes
-            )
+                AppLogger.logProcessing(
+                    "CompressImage",
+                    "ImageProcessor.compressImage",
+                    "format=${selectedFormat.label} quality=${qualityVal.toInt()}% maxDim=${selectedPreset.maxDim}"
+                )
 
-            compressionResult = result
-            isProcessing = false
+                val result = ImageProcessor.compressImage(
+                    src = src,
+                    format = selectedFormat.format,
+                    quality = qualityVal.toInt(),
+                    maxWidth = selectedPreset.maxDim,
+                    maxHeight = selectedPreset.maxDim,
+                    destFile = exportFile,
+                    originalSizeBytes = originalSizeBytes
+                )
+
+                compressionResult = result
+                isProcessing = false
+                AppLogger.logResult("CompressImage", null, exportFile.absolutePath, result.outputSizeBytes)
+                AppLogger.logSuccess("CompressImage", "Saved ${result.savedPercentage.toInt()}%")
+            } catch (e: Exception) {
+                isProcessing = false
+                AppLogger.logFailed("CompressImage", e)
+                Toast.makeText(context, "Compression failed: ${e.localizedMessage}", Toast.LENGTH_SHORT).show()
+            }
         }
     }
 
-    fun saveToProjects(share: Boolean = false) {
+    fun performSave(onComplete: ((File?) -> Unit)? = null) {
         val res = compressionResult ?: return
-        scope.launch {
-            viewModel.saveProject(
-                title = "Compressed (${selectedFormat.label} ${qualityVal.toInt()}%)",
-                tool = ToolType.IMAGE_COMPRESSOR,
-                outputFile = res.file,
-                previewBitmap = originalBitmap,
-                width = res.outputWidth,
-                height = res.outputHeight,
-                format = selectedFormat.label
-            )
-            savedSuccess = true
+        isSaving = true
+        saveError = null
 
-            if (share) {
-                val mime = when (selectedFormat) {
-                    OutputFormat.WEBP -> "image/webp"
-                    OutputFormat.JPG -> "image/jpeg"
-                    OutputFormat.PNG -> "image/png"
+        scope.launch {
+            try {
+                val galleryResult = MediaStorageManager.saveImageToGallery(
+                    context = context,
+                    sourceFile = res.file,
+                    displayName = res.file.name,
+                    mimeType = selectedFormat.mime
+                )
+
+                if (galleryResult.isSuccess) {
+                    viewModel.saveProject(
+                        title = "Compressed (${selectedFormat.label} ${qualityVal.toInt()}%)",
+                        tool = ToolType.IMAGE_COMPRESSOR,
+                        outputFile = res.file,
+                        previewBitmap = originalBitmap,
+                        width = res.outputWidth,
+                        height = res.outputHeight,
+                        format = selectedFormat.label
+                    )
+                    savedSuccess = true
+                    isSaving = false
+                    Toast.makeText(context, "Saved to Gallery!", Toast.LENGTH_SHORT).show()
+                    onComplete?.invoke(res.file)
+                } else {
+                    val err = galleryResult.exceptionOrNull()?.localizedMessage ?: "Failed to write to Gallery"
+                    saveError = err
+                    isSaving = false
+                    Toast.makeText(context, "Save failed: $err", Toast.LENGTH_SHORT).show()
+                    onComplete?.invoke(null)
                 }
-                val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", res.file)
-                val intent = Intent(Intent.ACTION_SEND).apply {
-                    type = mime
-                    putExtra(Intent.EXTRA_STREAM, uri)
-                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                }
-                context.startActivity(Intent.createChooser(intent, "Share Compressed Image"))
+            } catch (e: Exception) {
+                isSaving = false
+                saveError = e.localizedMessage
+                AppLogger.logFailed("SaveCompressedImage", e)
+                Toast.makeText(context, "Save error: ${e.localizedMessage}", Toast.LENGTH_SHORT).show()
+                onComplete?.invoke(null)
             }
+        }
+    }
+
+    fun performShare() {
+        val res = compressionResult
+        if (res != null && res.file.exists()) {
+            MediaStorageManager.shareMediaFile(
+                context = context,
+                file = res.file,
+                mimeType = selectedFormat.mime,
+                chooserTitle = "Share Compressed Image"
+            )
         }
     }
 
@@ -311,7 +354,7 @@ fun CompressScreen(
                                 .padding(12.dp)
                         ) {
                             Text(
-                                text = "${originalBitmap!!.width} × ${originalBitmap!!.height} px",
+                                text = "${originalBitmap!!.width} × ${originalBitmap!!.height} px (${formatBytes(originalSizeBytes)})",
                                 color = Color.White,
                                 fontSize = 12.sp,
                                 modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
@@ -327,7 +370,7 @@ fun CompressScreen(
                         Surface(
                             shape = RoundedCornerShape(16.dp),
                             color = DarkSurfaceElevated,
-                            border = androidx.compose.foundation.BorderStroke(1.dp, NeonEmerald.copy(alpha = 0.5f)),
+                            border = BorderStroke(1.dp, NeonEmerald.copy(alpha = 0.5f)),
                             modifier = Modifier.fillMaxWidth()
                         ) {
                             Row(
@@ -360,7 +403,7 @@ fun CompressScreen(
                                 Surface(
                                     shape = RoundedCornerShape(12.dp),
                                     color = NeonEmerald.copy(alpha = 0.2f),
-                                    border = androidx.compose.foundation.BorderStroke(1.dp, NeonEmerald)
+                                    border = BorderStroke(1.dp, NeonEmerald)
                                 ) {
                                     Text(
                                         text = "-${res.savedPercentage.toInt()}% Saved",
@@ -489,12 +532,23 @@ fun CompressScreen(
                         }
                     }
 
+                    if (saveError != null) {
+                        Spacer(modifier = Modifier.height(14.dp))
+                        Text(
+                            text = "Save failed: $saveError",
+                            color = Color(0xFFFF5252),
+                            fontSize = 13.sp,
+                            textAlign = TextAlign.Center
+                        )
+                    }
+
                     Spacer(modifier = Modifier.height(24.dp))
 
                     // Compress Button
                     if (compressionResult == null) {
                         Button(
                             onClick = { startCompress() },
+                            enabled = !isProcessing,
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .height(54.dp)
@@ -502,19 +556,25 @@ fun CompressScreen(
                             shape = RoundedCornerShape(16.dp),
                             colors = ButtonDefaults.buttonColors(containerColor = ElectricCyan)
                         ) {
-                            Icon(
-                                imageVector = Icons.Default.Compress,
-                                contentDescription = null,
-                                tint = Color.Black,
-                                modifier = Modifier.size(20.dp)
-                            )
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text(
-                                text = "Compress Now",
-                                fontSize = 15.sp,
-                                fontWeight = FontWeight.Bold,
-                                color = Color.Black
-                            )
+                            if (isProcessing) {
+                                CircularProgressIndicator(color = Color.Black, modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text("Compressing...", color = Color.Black, fontWeight = FontWeight.Bold)
+                            } else {
+                                Icon(
+                                    imageVector = Icons.Default.Compress,
+                                    contentDescription = null,
+                                    tint = Color.Black,
+                                    modifier = Modifier.size(20.dp)
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(
+                                    text = "Compress Now",
+                                    fontSize = 15.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = Color.Black
+                                )
+                            }
                         }
                     } else {
                         Row(
@@ -532,7 +592,8 @@ fun CompressScreen(
                             }
 
                             Button(
-                                onClick = { saveToProjects(share = false) },
+                                onClick = { performSave() },
+                                enabled = !isSaving,
                                 modifier = Modifier
                                     .weight(1f)
                                     .height(52.dp)
@@ -540,28 +601,35 @@ fun CompressScreen(
                                 shape = RoundedCornerShape(14.dp),
                                 colors = ButtonDefaults.buttonColors(containerColor = ElectricCyan)
                             ) {
-                                Icon(
-                                    imageVector = if (savedSuccess) Icons.Default.Check else Icons.Default.Download,
-                                    contentDescription = null,
-                                    tint = Color.Black,
-                                    modifier = Modifier.size(18.dp)
-                                )
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text(
-                                    text = if (savedSuccess) "Saved!" else "Save Project",
-                                    color = Color.Black,
-                                    fontWeight = FontWeight.Bold
-                                )
+                                if (isSaving) {
+                                    CircularProgressIndicator(color = Color.Black, modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text("Saving...", color = Color.Black, fontWeight = FontWeight.Bold)
+                                } else {
+                                    Icon(
+                                        imageVector = if (savedSuccess) Icons.Default.Check else Icons.Default.Download,
+                                        contentDescription = null,
+                                        tint = Color.Black,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(
+                                        text = if (savedSuccess) "Saved!" else "Save to Gallery",
+                                        color = Color.Black,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
                             }
                         }
 
                         Spacer(modifier = Modifier.height(12.dp))
 
                         Button(
-                            onClick = { saveToProjects(share = true) },
+                            onClick = { performShare() },
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .height(52.dp),
+                                .height(52.dp)
+                                .testTag("share_compressed_button"),
                             shape = RoundedCornerShape(14.dp),
                             colors = ButtonDefaults.buttonColors(containerColor = NeonViolet)
                         ) {

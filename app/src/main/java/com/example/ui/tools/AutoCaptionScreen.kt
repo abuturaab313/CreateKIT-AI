@@ -1,8 +1,8 @@
 package com.example.ui.tools
 
-import android.content.Intent
 import android.graphics.Bitmap
 import android.net.Uri
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
@@ -22,10 +22,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -35,16 +33,15 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.ClosedCaption
-import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.FileDownload
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.VideoFile
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
@@ -70,13 +67,15 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.core.content.FileProvider
 import com.example.data.model.ToolType
 import com.example.engine.AiResult
 import com.example.engine.CaptionCue
 import com.example.engine.CaptionEngine
 import com.example.engine.CaptionStyle
 import com.example.engine.VideoInspectorEngine
+import com.example.engine.processor.AppLogger
+import com.example.engine.processor.MediaProcessor
+import com.example.engine.processor.MediaStorageManager
 import com.example.ui.MainViewModel
 import com.example.ui.components.CreditDialog
 import com.example.ui.components.ErrorStateCard
@@ -85,11 +84,9 @@ import com.example.ui.components.ProcessingOverlay
 import com.example.ui.theme.DarkSurface
 import com.example.ui.theme.DarkSurfaceElevated
 import com.example.ui.theme.ElectricCyan
-import com.example.ui.theme.NeonAmber
 import com.example.ui.theme.NeonViolet
 import kotlinx.coroutines.launch
 import java.io.File
-import java.io.FileOutputStream
 
 @Composable
 fun AutoCaptionScreen(
@@ -107,6 +104,7 @@ fun AutoCaptionScreen(
     var selectedStyle by remember { mutableStateOf(CaptionStyle.SHORTS) }
 
     var isProcessing by remember { mutableStateOf(false) }
+    var isExporting by remember { mutableStateOf(false) }
     var progressVal by remember { mutableFloatStateOf(0f) }
     var statusText by remember { mutableStateOf("") }
     var errorMessage by remember { mutableStateOf<String?>(null) }
@@ -124,6 +122,7 @@ fun AutoCaptionScreen(
             if (info != null) {
                 videoDurationMs = info.durationMs
                 videoFrameBitmap = info.thumbnail
+                AppLogger.logStart("AutoCaption", uri.toString(), "video/mp4", info.fileSizeBytes)
             }
         }
     }
@@ -142,6 +141,7 @@ fun AutoCaptionScreen(
         statusText = "Extracting audio spectrum..."
 
         scope.launch {
+            AppLogger.logProcessing("AutoCaption", "transcribeAudio", "duration=${videoDurationMs}ms")
             val result = viewModel.cloudAiClient.transcribeAudio(videoDurationMs) { p, stage ->
                 progressVal = p
                 statusText = stage
@@ -152,43 +152,66 @@ fun AutoCaptionScreen(
                 is AiResult.Success -> {
                     captionCues.clear()
                     captionCues.addAll(result.data)
+                    AppLogger.logSuccess("AutoCaption", "Generated ${result.data.size} caption cues")
                 }
                 is AiResult.Error -> {
                     errorMessage = result.message
+                    AppLogger.logFailed("AutoCaption", Exception(result.message))
                 }
             }
         }
     }
 
-    fun exportCaptions(isVtt: Boolean) {
+    fun exportCaptions(isVtt: Boolean, share: Boolean = false) {
+        if (captionCues.isEmpty()) return
+        isExporting = true
+
         scope.launch {
-            val exportDir = File(context.filesDir, "exports").apply { mkdirs() }
-            val ext = if (isVtt) "vtt" else "srt"
-            val file = File(exportDir, "subtitles_${System.currentTimeMillis()}.$ext")
-            if (isVtt) {
-                CaptionEngine.exportVtt(captionCues.toList(), file)
-            } else {
-                CaptionEngine.exportSrt(captionCues.toList(), file)
-            }
+            try {
+                val exportDir = MediaProcessor.getExportDirectory(context)
+                val ext = if (isVtt) "vtt" else "srt"
+                val file = File(exportDir, "subtitles_${System.currentTimeMillis()}.$ext")
+                if (isVtt) {
+                    CaptionEngine.exportVtt(captionCues.toList(), file)
+                } else {
+                    CaptionEngine.exportSrt(captionCues.toList(), file)
+                }
 
-            viewModel.saveProject(
-                title = "Subtitles (${ext.uppercase()})",
-                tool = ToolType.AUTO_CAPTION,
-                outputFile = file,
-                previewBitmap = videoFrameBitmap,
-                width = 1080,
-                height = 1920,
-                format = ext.uppercase()
-            )
-            savedSuccess = true
+                val saveRes = MediaStorageManager.saveDocumentToDownloads(
+                    context = context,
+                    sourceFile = file,
+                    displayName = file.name,
+                    mimeType = "text/plain"
+                )
 
-            val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
-            val intent = Intent(Intent.ACTION_SEND).apply {
-                type = "text/plain"
-                putExtra(Intent.EXTRA_STREAM, uri)
-                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                if (saveRes.isSuccess) {
+                    viewModel.saveProject(
+                        title = "Subtitles (${ext.uppercase()})",
+                        tool = ToolType.AUTO_CAPTION,
+                        outputFile = file,
+                        previewBitmap = videoFrameBitmap,
+                        width = 1080,
+                        height = 1920,
+                        format = ext.uppercase()
+                    )
+                    savedSuccess = true
+                    Toast.makeText(context, "Exported to Downloads (${file.name})", Toast.LENGTH_SHORT).show()
+                }
+
+                if (share) {
+                    MediaStorageManager.shareMediaFile(
+                        context = context,
+                        file = file,
+                        mimeType = "text/plain",
+                        chooserTitle = "Share Subtitles (.${ext})"
+                    )
+                }
+                isExporting = false
+            } catch (e: Exception) {
+                isExporting = false
+                AppLogger.logFailed("ExportCaptions", e)
+                Toast.makeText(context, "Export failed: ${e.localizedMessage}", Toast.LENGTH_SHORT).show()
             }
-            context.startActivity(Intent.createChooser(intent, "Export Subtitles"))
         }
     }
 
@@ -386,6 +409,7 @@ fun AutoCaptionScreen(
                     if (captionCues.isEmpty()) {
                         Button(
                             onClick = { startTranscription() },
+                            enabled = !isProcessing,
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .height(54.dp)
@@ -470,7 +494,8 @@ fun AutoCaptionScreen(
                             horizontalArrangement = Arrangement.spacedBy(10.dp)
                         ) {
                             Button(
-                                onClick = { exportCaptions(isVtt = false) },
+                                onClick = { exportCaptions(isVtt = false, share = false) },
+                                enabled = !isExporting,
                                 modifier = Modifier
                                     .weight(1f)
                                     .height(52.dp)
@@ -484,7 +509,8 @@ fun AutoCaptionScreen(
                             }
 
                             Button(
-                                onClick = { exportCaptions(isVtt = true) },
+                                onClick = { exportCaptions(isVtt = true, share = false) },
+                                enabled = !isExporting,
                                 modifier = Modifier
                                     .weight(1f)
                                     .height(52.dp)

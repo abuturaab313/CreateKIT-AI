@@ -1,12 +1,10 @@
 package com.example.ui.tools
 
-import android.content.Intent
 import android.graphics.Bitmap
-import android.graphics.Color as AndroidColor
 import android.net.Uri
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -32,20 +30,17 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.filled.AddPhotoAlternate
-import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Layers
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.Slider
-import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
@@ -54,6 +49,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -70,11 +66,12 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.core.content.FileProvider
 import com.example.data.model.ToolType
 import com.example.engine.AiResult
 import com.example.engine.BgType
-import com.example.engine.ImageProcessor
+import com.example.engine.processor.AppLogger
+import com.example.engine.processor.MediaProcessor
+import com.example.engine.processor.MediaStorageManager
 import com.example.ui.MainViewModel
 import com.example.ui.components.CreditDialog
 import com.example.ui.components.ErrorStateCard
@@ -83,11 +80,10 @@ import com.example.ui.components.ProcessingOverlay
 import com.example.ui.theme.DarkSurface
 import com.example.ui.theme.DarkSurfaceElevated
 import com.example.ui.theme.ElectricCyan
-import com.example.ui.theme.NeonAmber
 import com.example.ui.theme.NeonViolet
 import kotlinx.coroutines.launch
 import java.io.File
-import java.io.FileOutputStream
+import android.graphics.Color as AndroidColor
 
 @Composable
 fun BackgroundRemoverScreen(
@@ -97,30 +93,37 @@ fun BackgroundRemoverScreen(
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
 
+    var selectedInputUri by remember { mutableStateOf<Uri?>(null) }
     var originalBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var processedBitmap by remember { mutableStateOf<Bitmap?>(null) }
-    var customBgBitmap by remember { mutableStateOf<Bitmap?>(null) }
-
     var bgType by remember { mutableStateOf(BgType.TRANSPARENT) }
-    var selectedColor by remember { mutableStateOf(AndroidColor.WHITE) }
+    var selectedColor by remember { mutableIntStateOf(AndroidColor.WHITE) }
+    var customBgBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var addShadow by remember { mutableStateOf(false) }
-    var featherVal by remember { mutableFloatStateOf(2f) }
 
     var isProcessing by remember { mutableStateOf(false) }
+    var isSaving by remember { mutableStateOf(false) }
     var progressVal by remember { mutableFloatStateOf(0f) }
     var statusText by remember { mutableStateOf("") }
     var errorMessage by remember { mutableStateOf<String?>(null) }
     var showCreditDialog by remember { mutableStateOf(false) }
+    var lastSavedFile by remember { mutableStateOf<File?>(null) }
     var savedSuccess by remember { mutableStateOf(false) }
+    var saveError by remember { mutableStateOf<String?>(null) }
 
     val photoPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
     ) { uri: Uri? ->
         if (uri != null) {
+            selectedInputUri = uri
             errorMessage = null
             processedBitmap = null
+            lastSavedFile = null
             savedSuccess = false
-            originalBitmap = ImageProcessor.loadBitmapFromUri(context, uri, 1920)
+            saveError = null
+            val inputSize = MediaProcessor.image.getFileSizeFromUri(context, uri)
+            AppLogger.logStart("RemoveBackground", uri.toString(), context.contentResolver.getType(uri), inputSize)
+            originalBitmap = MediaProcessor.image.loadBitmapFromUri(context, uri, 1920)
         }
     }
 
@@ -128,7 +131,7 @@ fun BackgroundRemoverScreen(
         contract = ActivityResultContracts.GetContent()
     ) { uri: Uri? ->
         if (uri != null) {
-            customBgBitmap = ImageProcessor.loadBitmapFromUri(context, uri, 1920)
+            customBgBitmap = MediaProcessor.image.loadBitmapFromUri(context, uri, 1920)
             bgType = BgType.CUSTOM_IMAGE
         }
     }
@@ -153,15 +156,16 @@ fun BackgroundRemoverScreen(
         isProcessing = true
         errorMessage = null
         progressVal = 0.15f
-        statusText = "Segmenting background..."
+        statusText = "Segmenting foreground subject..."
 
         scope.launch {
+            AppLogger.logProcessing("RemoveBackground", "MediaProcessor.ai.removeBackground", "bgType=$bgType shadow=$addShadow")
             val result = viewModel.cloudAiClient.removeBackgroundWithAi(
                 bitmap = src,
                 bgType = bgType,
                 solidColor = selectedColor,
                 customBg = customBgBitmap,
-                feather = featherVal,
+                feather = 2f,
                 addShadow = addShadow
             ) { p, stage ->
                 progressVal = p
@@ -172,47 +176,75 @@ fun BackgroundRemoverScreen(
             when (result) {
                 is AiResult.Success -> {
                     processedBitmap = result.data
+                    savedSuccess = false
+                    saveError = null
+                    AppLogger.logSuccess("RemoveBackground", "Segmented successfully (${result.latencyMs}ms)")
                 }
                 is AiResult.Error -> {
                     errorMessage = result.message
+                    AppLogger.logFailed("RemoveBackground", RuntimeException(result.message))
                 }
             }
         }
     }
 
-    fun saveAndShare(share: Boolean = false) {
+    fun performSave(onComplete: ((File?) -> Unit)? = null) {
         val result = processedBitmap ?: return
+        isSaving = true
+        saveError = null
+
         scope.launch {
-            val exportDir = File(context.filesDir, "exports").apply { mkdirs() }
             val isTransparent = (bgType == BgType.TRANSPARENT)
-            val ext = if (isTransparent) "png" else "jpg"
             val format = if (isTransparent) Bitmap.CompressFormat.PNG else Bitmap.CompressFormat.JPEG
+            val ext = if (isTransparent) "png" else "jpg"
+            val title = "cutout_${System.currentTimeMillis()}"
 
-            val exportFile = File(exportDir, "cutout_${System.currentTimeMillis()}.$ext")
-            val fos = FileOutputStream(exportFile)
-            result.compress(format, 100, fos)
-            fos.flush()
-            fos.close()
-
-            viewModel.saveProject(
-                title = if (isTransparent) "Transparent Cutout" else "Background Replacement",
-                tool = ToolType.BACKGROUND_REMOVER,
-                outputFile = exportFile,
-                previewBitmap = result,
-                width = result.width,
-                height = result.height,
-                format = ext.uppercase()
+            val saveResult = MediaStorageManager.saveBitmapToGallery(
+                context = context,
+                bitmap = result,
+                displayName = title,
+                format = format,
+                quality = 100
             )
-            savedSuccess = true
 
-            if (share) {
-                val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", exportFile)
-                val intent = Intent(Intent.ACTION_SEND).apply {
-                    type = if (isTransparent) "image/png" else "image/jpeg"
-                    putExtra(Intent.EXTRA_STREAM, uri)
-                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            if (saveResult.isSuccess) {
+                val (file, galleryUri) = saveResult.getOrThrow()
+                lastSavedFile = file
+                viewModel.saveProject(
+                    title = if (isTransparent) "Transparent Cutout" else "Background Replacement",
+                    tool = ToolType.BACKGROUND_REMOVER,
+                    outputFile = file,
+                    previewBitmap = result,
+                    width = result.width,
+                    height = result.height,
+                    format = ext.uppercase()
+                )
+                savedSuccess = true
+                isSaving = false
+                Toast.makeText(context, "Saved to Gallery!", Toast.LENGTH_SHORT).show()
+                onComplete?.invoke(file)
+            } else {
+                val err = saveResult.exceptionOrNull()?.localizedMessage ?: "Failed to save image"
+                saveError = err
+                isSaving = false
+                Toast.makeText(context, "Save failed: $err", Toast.LENGTH_SHORT).show()
+                onComplete?.invoke(null)
+            }
+        }
+    }
+
+    fun performShare() {
+        val cachedFile = lastSavedFile
+        val isTransparent = (bgType == BgType.TRANSPARENT)
+        val mime = if (isTransparent) "image/png" else "image/jpeg"
+
+        if (cachedFile != null && cachedFile.exists()) {
+            MediaStorageManager.shareMediaFile(context, cachedFile, mime, "Share Cutout")
+        } else {
+            performSave { file ->
+                if (file != null && file.exists()) {
+                    MediaStorageManager.shareMediaFile(context, file, mime, "Share Cutout")
                 }
-                context.startActivity(Intent.createChooser(intent, "Share Cutout"))
             }
         }
     }
@@ -324,10 +356,11 @@ fun BackgroundRemoverScreen(
                     }
                 } else {
                     // Preview Frame
+                    val aspect = (originalBitmap!!.width.toFloat() / originalBitmap!!.height.coerceAtLeast(1).toFloat()).coerceIn(0.6f, 2.2f)
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .aspectRatio(4f / 3f)
+                            .aspectRatio(aspect)
                             .clip(RoundedCornerShape(20.dp))
                             .background(DarkSurface),
                         contentAlignment = Alignment.Center
@@ -365,7 +398,10 @@ fun BackgroundRemoverScreen(
                             modifier = Modifier
                                 .weight(1f)
                                 .clip(RoundedCornerShape(12.dp))
-                                .clickable { bgType = BgType.TRANSPARENT }
+                                .clickable {
+                                    bgType = BgType.TRANSPARENT
+                                    processedBitmap = null
+                                }
                                 .testTag("bg_transparent_toggle")
                         ) {
                             Text(
@@ -384,7 +420,10 @@ fun BackgroundRemoverScreen(
                             modifier = Modifier
                                 .weight(1f)
                                 .clip(RoundedCornerShape(12.dp))
-                                .clickable { bgType = BgType.CUSTOM_COLOR }
+                                .clickable {
+                                    bgType = BgType.CUSTOM_COLOR
+                                    processedBitmap = null
+                                }
                                 .testTag("bg_solid_toggle")
                         ) {
                             Text(
@@ -403,7 +442,10 @@ fun BackgroundRemoverScreen(
                             modifier = Modifier
                                 .weight(1f)
                                 .clip(RoundedCornerShape(12.dp))
-                                .clickable { customBgPicker.launch("image/*") }
+                                .clickable {
+                                    processedBitmap = null
+                                    customBgPicker.launch("image/*")
+                                }
                                 .testTag("bg_custom_image_toggle")
                         ) {
                             Text(
@@ -434,13 +476,8 @@ fun BackgroundRemoverScreen(
                                         .clickable {
                                             selectedColor = colorInt
                                             bgType = BgType.CUSTOM_COLOR
-                                        }
-                                        .then(
-                                            if (isChosen) Modifier.background(
-                                                ElectricCyan,
-                                                shape = CircleShape
-                                            ) else Modifier
-                                        ),
+                                            processedBitmap = null
+                                        },
                                     contentAlignment = Alignment.Center
                                 ) {
                                     if (isChosen) {
@@ -476,11 +513,24 @@ fun BackgroundRemoverScreen(
                         )
                         Switch(
                             checked = addShadow,
-                            onCheckedChange = { addShadow = it },
+                            onCheckedChange = {
+                                addShadow = it
+                                processedBitmap = null
+                            },
                             colors = SwitchDefaults.colors(
                                 checkedThumbColor = ElectricCyan,
                                 checkedTrackColor = DarkSurface
                             )
+                        )
+                    }
+
+                    if (saveError != null) {
+                        Spacer(modifier = Modifier.height(14.dp))
+                        Text(
+                            text = "Save failed: $saveError",
+                            color = Color(0xFFFF5252),
+                            fontSize = 13.sp,
+                            textAlign = TextAlign.Center
                         )
                     }
 
@@ -490,8 +540,7 @@ fun BackgroundRemoverScreen(
                         ErrorStateCard(
                             errorMessage = errorMessage!!,
                             onRetry = { startProcessing() },
-                            onCancel = { errorMessage = null },
-                            onReportProblem = {}
+                            onCancel = { errorMessage = null }
                         )
                         Spacer(modifier = Modifier.height(16.dp))
                     }
@@ -499,6 +548,7 @@ fun BackgroundRemoverScreen(
                     if (processedBitmap == null) {
                         Button(
                             onClick = { startProcessing() },
+                            enabled = !isProcessing,
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .height(54.dp)
@@ -507,14 +557,14 @@ fun BackgroundRemoverScreen(
                             colors = ButtonDefaults.buttonColors(containerColor = ElectricCyan)
                         ) {
                             Icon(
-                                imageVector = Icons.Default.AutoAwesome,
+                                imageVector = Icons.Default.Layers,
                                 contentDescription = null,
                                 tint = Color.Black,
                                 modifier = Modifier.size(20.dp)
                             )
                             Spacer(modifier = Modifier.width(8.dp))
                             Text(
-                                text = "Remove Background (1 Credit)",
+                                text = "Remove Background",
                                 fontSize = 15.sp,
                                 fontWeight = FontWeight.Bold,
                                 color = Color.Black
@@ -536,7 +586,8 @@ fun BackgroundRemoverScreen(
                             }
 
                             Button(
-                                onClick = { saveAndShare(share = false) },
+                                onClick = { performSave() },
+                                enabled = !isSaving,
                                 modifier = Modifier
                                     .weight(1f)
                                     .height(52.dp)
@@ -544,25 +595,31 @@ fun BackgroundRemoverScreen(
                                 shape = RoundedCornerShape(14.dp),
                                 colors = ButtonDefaults.buttonColors(containerColor = ElectricCyan)
                             ) {
-                                Icon(
-                                    imageVector = if (savedSuccess) Icons.Default.Check else Icons.Default.Download,
-                                    contentDescription = null,
-                                    tint = Color.Black,
-                                    modifier = Modifier.size(18.dp)
-                                )
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text(
-                                    text = if (savedSuccess) "Saved!" else "Save PNG",
-                                    color = Color.Black,
-                                    fontWeight = FontWeight.Bold
-                                )
+                                if (isSaving) {
+                                    CircularProgressIndicator(color = Color.Black, modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text("Saving...", color = Color.Black, fontWeight = FontWeight.Bold)
+                                } else {
+                                    Icon(
+                                        imageVector = if (savedSuccess) Icons.Default.Check else Icons.Default.Download,
+                                        contentDescription = null,
+                                        tint = Color.Black,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(
+                                        text = if (savedSuccess) "Saved!" else "Save PNG",
+                                        color = Color.Black,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
                             }
                         }
 
                         Spacer(modifier = Modifier.height(12.dp))
 
                         Button(
-                            onClick = { saveAndShare(share = true) },
+                            onClick = { performShare() },
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .height(52.dp),

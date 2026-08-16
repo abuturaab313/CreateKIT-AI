@@ -1,8 +1,8 @@
 package com.example.ui.tools
 
-import android.content.Intent
 import android.graphics.Bitmap
 import android.net.Uri
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
@@ -28,17 +28,16 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.filled.AddPhotoAlternate
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Transform
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -60,16 +59,16 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.core.content.FileProvider
 import com.example.data.model.ToolType
-import com.example.engine.ImageProcessor
 import com.example.engine.PdfEngine
+import com.example.engine.processor.AppLogger
+import com.example.engine.processor.MediaProcessor
+import com.example.engine.processor.MediaStorageManager
 import com.example.ui.MainViewModel
 import com.example.ui.components.GlassCard
 import com.example.ui.theme.DarkSurface
 import com.example.ui.theme.DarkSurfaceElevated
 import com.example.ui.theme.ElectricCyan
-import com.example.ui.theme.NeonAmber
 import com.example.ui.theme.NeonViolet
 import kotlinx.coroutines.launch
 import java.io.File
@@ -90,72 +89,131 @@ fun FormatConverterScreen(
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
 
+    var selectedInputUri by remember { mutableStateOf<Uri?>(null) }
     var originalBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var selectedTarget by remember { mutableStateOf(TargetFormat.PNG) }
     var convertedFile by remember { mutableStateOf<File?>(null) }
     var isConverting by remember { mutableStateOf(false) }
+    var isSaving by remember { mutableStateOf(false) }
     var savedSuccess by remember { mutableStateOf(false) }
+    var saveError by remember { mutableStateOf<String?>(null) }
 
     val photoPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
     ) { uri: Uri? ->
         if (uri != null) {
+            selectedInputUri = uri
             convertedFile = null
             savedSuccess = false
-            originalBitmap = ImageProcessor.loadBitmapFromUri(context, uri, 3840)
+            saveError = null
+            val inputSize = MediaProcessor.image.getFileSizeFromUri(context, uri)
+            AppLogger.logStart("FormatConverter", uri.toString(), context.contentResolver.getType(uri), inputSize)
+            originalBitmap = MediaProcessor.image.loadBitmapFromUri(context, uri, 3840)
         }
     }
 
     fun convertFormat() {
         val src = originalBitmap ?: return
         isConverting = true
+        saveError = null
+        savedSuccess = false
+
         scope.launch {
-            val exportDir = File(context.filesDir, "exports").apply { mkdirs() }
-            val exportFile = File(exportDir, "converted_${System.currentTimeMillis()}.${selectedTarget.ext}")
+            try {
+                val exportDir = MediaProcessor.getExportDirectory(context)
+                val exportFile = File(exportDir, "converted_${System.currentTimeMillis()}.${selectedTarget.ext}")
 
-            if (selectedTarget == TargetFormat.PDF) {
-                PdfEngine.createPdfFromBitmaps(listOf(src), exportFile)
-            } else {
-                val format = when (selectedTarget) {
-                    TargetFormat.PNG -> Bitmap.CompressFormat.PNG
-                    TargetFormat.JPG -> Bitmap.CompressFormat.JPEG
-                    TargetFormat.WEBP -> Bitmap.CompressFormat.WEBP
-                    else -> Bitmap.CompressFormat.PNG
+                AppLogger.logProcessing("FormatConverter", "Conversion", "Target format: ${selectedTarget.label}")
+                if (selectedTarget == TargetFormat.PDF) {
+                    PdfEngine.createPdfFromBitmaps(listOf(src), exportFile)
+                } else {
+                    val format = when (selectedTarget) {
+                        TargetFormat.PNG -> Bitmap.CompressFormat.PNG
+                        TargetFormat.JPG -> Bitmap.CompressFormat.JPEG
+                        TargetFormat.WEBP -> Bitmap.CompressFormat.WEBP
+                        else -> Bitmap.CompressFormat.PNG
+                    }
+                    val fos = FileOutputStream(exportFile)
+                    src.compress(format, 95, fos)
+                    fos.flush()
+                    fos.close()
                 }
-                val fos = FileOutputStream(exportFile)
-                src.compress(format, 95, fos)
-                fos.flush()
-                fos.close()
-            }
 
-            convertedFile = exportFile
-            isConverting = false
+                convertedFile = exportFile
+                isConverting = false
+                AppLogger.logSuccess("FormatConverter", "Converted to ${exportFile.name} (${AppLogger.formatBytes(exportFile.length())})")
+            } catch (e: Exception) {
+                isConverting = false
+                AppLogger.logFailed("FormatConverter", e)
+                Toast.makeText(context, "Conversion failed: ${e.localizedMessage}", Toast.LENGTH_SHORT).show()
+            }
         }
     }
 
-    fun saveAndShare(share: Boolean = false) {
+    fun performSave(onComplete: ((File?) -> Unit)? = null) {
         val file = convertedFile ?: return
-        scope.launch {
-            viewModel.saveProject(
-                title = "Converted to ${selectedTarget.label}",
-                tool = ToolType.FORMAT_CONVERTER,
-                outputFile = file,
-                previewBitmap = originalBitmap,
-                width = originalBitmap?.width ?: 0,
-                height = originalBitmap?.height ?: 0,
-                format = selectedTarget.label
-            )
-            savedSuccess = true
+        isSaving = true
+        saveError = null
 
-            if (share) {
-                val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
-                val intent = Intent(Intent.ACTION_SEND).apply {
-                    type = selectedTarget.mime
-                    putExtra(Intent.EXTRA_STREAM, uri)
-                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        scope.launch {
+            try {
+                val result = if (selectedTarget == TargetFormat.PDF) {
+                    MediaStorageManager.saveDocumentToDownloads(
+                        context = context,
+                        sourceFile = file,
+                        displayName = file.name,
+                        mimeType = selectedTarget.mime
+                    )
+                } else {
+                    MediaStorageManager.saveImageToGallery(
+                        context = context,
+                        sourceFile = file,
+                        displayName = file.name,
+                        mimeType = selectedTarget.mime
+                    )
                 }
-                context.startActivity(Intent.createChooser(intent, "Share Converted File"))
+
+                if (result.isSuccess) {
+                    viewModel.saveProject(
+                        title = "Converted to ${selectedTarget.label}",
+                        tool = ToolType.FORMAT_CONVERTER,
+                        outputFile = file,
+                        previewBitmap = originalBitmap,
+                        width = originalBitmap?.width ?: 0,
+                        height = originalBitmap?.height ?: 0,
+                        format = selectedTarget.label
+                    )
+                    savedSuccess = true
+                    isSaving = false
+                    val destMsg = if (selectedTarget == TargetFormat.PDF) "Saved to Downloads!" else "Saved to Gallery!"
+                    Toast.makeText(context, destMsg, Toast.LENGTH_SHORT).show()
+                    onComplete?.invoke(file)
+                } else {
+                    val err = result.exceptionOrNull()?.localizedMessage ?: "Failed to save file"
+                    saveError = err
+                    isSaving = false
+                    Toast.makeText(context, "Save failed: $err", Toast.LENGTH_SHORT).show()
+                    onComplete?.invoke(null)
+                }
+            } catch (e: Exception) {
+                isSaving = false
+                saveError = e.localizedMessage
+                AppLogger.logFailed("SaveConvertedFile", e)
+                Toast.makeText(context, "Save error: ${e.localizedMessage}", Toast.LENGTH_SHORT).show()
+                onComplete?.invoke(null)
             }
+        }
+    }
+
+    fun performShare() {
+        val file = convertedFile
+        if (file != null && file.exists()) {
+            MediaStorageManager.shareMediaFile(
+                context = context,
+                file = file,
+                mimeType = selectedTarget.mime,
+                chooserTitle = "Share Converted File"
+            )
         }
     }
 
@@ -200,7 +258,7 @@ fun FormatConverterScreen(
 
                 if (originalBitmap != null) {
                     TextButton(
-                        onClick = { photoPicker.launch("*/*") }
+                        onClick = { photoPicker.launch("image/*") }
                     ) {
                         Text("Change", color = ElectricCyan)
                     }
@@ -264,10 +322,11 @@ fun FormatConverterScreen(
                         }
                     }
                 } else {
+                    val aspect = (originalBitmap!!.width.toFloat() / originalBitmap!!.height.coerceAtLeast(1).toFloat()).coerceIn(0.6f, 2.2f)
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .aspectRatio(4f / 3f)
+                            .aspectRatio(aspect)
                             .clip(RoundedCornerShape(20.dp))
                             .background(DarkSurface),
                         contentAlignment = Alignment.Center
@@ -303,7 +362,10 @@ fun FormatConverterScreen(
                                 modifier = Modifier
                                     .weight(1f)
                                     .clip(RoundedCornerShape(12.dp))
-                                    .clickable { selectedTarget = fmt }
+                                    .clickable {
+                                        selectedTarget = fmt
+                                        convertedFile = null
+                                    }
                                     .testTag("convert_format_${fmt.name}")
                             ) {
                                 Text(
@@ -318,11 +380,22 @@ fun FormatConverterScreen(
                         }
                     }
 
+                    if (saveError != null) {
+                        Spacer(modifier = Modifier.height(14.dp))
+                        Text(
+                            text = "Save failed: $saveError",
+                            color = Color(0xFFFF5252),
+                            fontSize = 13.sp,
+                            textAlign = TextAlign.Center
+                        )
+                    }
+
                     Spacer(modifier = Modifier.height(24.dp))
 
                     if (convertedFile == null) {
                         Button(
                             onClick = { convertFormat() },
+                            enabled = !isConverting,
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .height(54.dp)
@@ -330,27 +403,35 @@ fun FormatConverterScreen(
                             shape = RoundedCornerShape(16.dp),
                             colors = ButtonDefaults.buttonColors(containerColor = ElectricCyan)
                         ) {
-                            Text(
-                                text = "Convert to ${selectedTarget.label}",
-                                fontSize = 15.sp,
-                                fontWeight = FontWeight.Bold,
-                                color = Color.Black
-                            )
+                            if (isConverting) {
+                                CircularProgressIndicator(color = Color.Black, modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text("Converting...", color = Color.Black, fontWeight = FontWeight.Bold)
+                            } else {
+                                Text(
+                                    text = "Convert to ${selectedTarget.label}",
+                                    fontSize = 15.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = Color.Black
+                                )
+                            }
                         }
                     } else {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        Button(
+                            onClick = { performSave() },
+                            enabled = !isSaving,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(52.dp)
+                                .testTag("save_converted_button"),
+                            shape = RoundedCornerShape(14.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = ElectricCyan)
                         ) {
-                            Button(
-                                onClick = { saveAndShare(share = false) },
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .height(52.dp)
-                                    .testTag("save_converted_button"),
-                                shape = RoundedCornerShape(14.dp),
-                                colors = ButtonDefaults.buttonColors(containerColor = ElectricCyan)
-                            ) {
+                            if (isSaving) {
+                                CircularProgressIndicator(color = Color.Black, modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("Saving...", color = Color.Black, fontWeight = FontWeight.Bold)
+                            } else {
                                 Icon(
                                     imageVector = if (savedSuccess) Icons.Default.Check else Icons.Default.Download,
                                     contentDescription = null,
@@ -369,7 +450,7 @@ fun FormatConverterScreen(
                         Spacer(modifier = Modifier.height(12.dp))
 
                         Button(
-                            onClick = { saveAndShare(share = true) },
+                            onClick = { performShare() },
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .height(52.dp),

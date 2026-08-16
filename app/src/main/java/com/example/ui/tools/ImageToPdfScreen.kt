@@ -1,10 +1,11 @@
 package com.example.ui.tools
 
-import android.content.Intent
 import android.graphics.Bitmap
 import android.net.Uri
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -29,20 +30,17 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.AddPhotoAlternate
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.PictureAsPdf
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -65,14 +63,14 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.core.content.FileProvider
 import com.example.data.model.ToolType
-import com.example.engine.ImageProcessor
 import com.example.engine.PdfEngine
 import com.example.engine.PdfGenerationResult
+import com.example.engine.processor.AppLogger
+import com.example.engine.processor.MediaProcessor
+import com.example.engine.processor.MediaStorageManager
 import com.example.ui.MainViewModel
 import com.example.ui.components.GlassCard
-import com.example.ui.theme.DarkSurface
 import com.example.ui.theme.DarkSurfaceElevated
 import com.example.ui.theme.ElectricCyan
 import com.example.ui.theme.NeonEmerald
@@ -91,8 +89,10 @@ fun ImageToPdfScreen(
     val selectedBitmaps = remember { mutableStateListOf<Bitmap>() }
     var pdfResult by remember { mutableStateOf<PdfGenerationResult?>(null) }
     var isGenerating by remember { mutableStateOf(false) }
+    var isSaving by remember { mutableStateOf(false) }
     var pageSize by remember { mutableStateOf("A4") }
     var savedSuccess by remember { mutableStateOf(false) }
+    var saveError by remember { mutableStateOf<String?>(null) }
 
     val multiPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetMultipleContents()
@@ -100,58 +100,102 @@ fun ImageToPdfScreen(
         if (uris.isNotEmpty()) {
             pdfResult = null
             savedSuccess = false
+            saveError = null
             uris.forEach { uri ->
-                val bmp = ImageProcessor.loadBitmapFromUri(context, uri, 1920)
+                val bmp = MediaProcessor.image.loadBitmapFromUri(context, uri, 1920)
                 if (bmp != null) {
                     selectedBitmaps.add(bmp)
                 }
             }
+            AppLogger.logStart("ImageToPdf", "${selectedBitmaps.size} images", "image/*", 0L)
         }
     }
 
     fun generatePdf() {
         if (selectedBitmaps.isEmpty()) return
         isGenerating = true
+        saveError = null
+        savedSuccess = false
+
         scope.launch {
-            val exportDir = File(context.filesDir, "exports").apply { mkdirs() }
-            val exportFile = File(exportDir, "document_${System.currentTimeMillis()}.pdf")
+            try {
+                val exportDir = MediaProcessor.getExportDirectory(context)
+                val exportFile = File(exportDir, "document_${System.currentTimeMillis()}.pdf")
 
-            val (w, h) = if (pageSize == "Letter") 612 to 792 else 595 to 842
-            val result = PdfEngine.createPdfFromBitmaps(
-                bitmaps = selectedBitmaps.toList(),
-                outputFile = exportFile,
-                pageWidth = w,
-                pageHeight = h
-            )
+                val (w, h) = if (pageSize == "Letter") 612 to 792 else 595 to 842
+                AppLogger.logProcessing("ImageToPdf", "PdfEngine.createPdfFromBitmaps", "pages=${selectedBitmaps.size} size=$pageSize")
+                val result = PdfEngine.createPdfFromBitmaps(
+                    bitmaps = selectedBitmaps.toList(),
+                    outputFile = exportFile,
+                    pageWidth = w,
+                    pageHeight = h
+                )
 
-            pdfResult = result
-            isGenerating = false
+                pdfResult = result
+                isGenerating = false
+                AppLogger.logSuccess("ImageToPdf", "Generated ${result.pageCount} pages (${AppLogger.formatBytes(result.fileSizeBytes)})")
+            } catch (e: Exception) {
+                isGenerating = false
+                AppLogger.logFailed("ImageToPdf", e)
+                Toast.makeText(context, "PDF generation failed: ${e.localizedMessage}", Toast.LENGTH_SHORT).show()
+            }
         }
     }
 
-    fun saveAndShare(share: Boolean = false) {
+    fun performSave(onComplete: ((File?) -> Unit)? = null) {
         val res = pdfResult ?: return
-        scope.launch {
-            viewModel.saveProject(
-                title = "PDF Document (${res.pageCount} Pages)",
-                tool = ToolType.IMAGE_TO_PDF,
-                outputFile = res.file,
-                previewBitmap = selectedBitmaps.firstOrNull(),
-                width = 595,
-                height = 842,
-                format = "PDF"
-            )
-            savedSuccess = true
+        isSaving = true
+        saveError = null
 
-            if (share) {
-                val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", res.file)
-                val intent = Intent(Intent.ACTION_SEND).apply {
-                    type = "application/pdf"
-                    putExtra(Intent.EXTRA_STREAM, uri)
-                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        scope.launch {
+            try {
+                val saveRes = MediaStorageManager.saveDocumentToDownloads(
+                    context = context,
+                    sourceFile = res.file,
+                    displayName = res.file.name,
+                    mimeType = "application/pdf"
+                )
+
+                if (saveRes.isSuccess) {
+                    viewModel.saveProject(
+                        title = "PDF Document (${res.pageCount} Pages)",
+                        tool = ToolType.IMAGE_TO_PDF,
+                        outputFile = res.file,
+                        previewBitmap = selectedBitmaps.firstOrNull(),
+                        width = 595,
+                        height = 842,
+                        format = "PDF"
+                    )
+                    savedSuccess = true
+                    isSaving = false
+                    Toast.makeText(context, "Saved to Downloads folder!", Toast.LENGTH_SHORT).show()
+                    onComplete?.invoke(res.file)
+                } else {
+                    val err = saveRes.exceptionOrNull()?.localizedMessage ?: "Failed to save PDF"
+                    saveError = err
+                    isSaving = false
+                    Toast.makeText(context, "Save failed: $err", Toast.LENGTH_SHORT).show()
+                    onComplete?.invoke(null)
                 }
-                context.startActivity(Intent.createChooser(intent, "Share PDF Document"))
+            } catch (e: Exception) {
+                isSaving = false
+                saveError = e.localizedMessage
+                AppLogger.logFailed("SavePdfDocument", e)
+                Toast.makeText(context, "Save error: ${e.localizedMessage}", Toast.LENGTH_SHORT).show()
+                onComplete?.invoke(null)
             }
+        }
+    }
+
+    fun performShare() {
+        val res = pdfResult
+        if (res != null && res.file.exists()) {
+            MediaStorageManager.shareMediaFile(
+                context = context,
+                file = res.file,
+                mimeType = "application/pdf",
+                chooserTitle = "Share PDF Document"
+            )
         }
     }
 
@@ -295,14 +339,17 @@ fun ImageToPdfScreen(
                                         .align(Alignment.TopStart)
                                         .padding(6.dp)
                                         .size(24.dp)
-                                ) {
+                                  ) {
                                     Box(contentAlignment = Alignment.Center) {
                                         Text(text = "${idx + 1}", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
                                     }
                                 }
 
                                 IconButton(
-                                    onClick = { selectedBitmaps.removeAt(idx) },
+                                    onClick = {
+                                        selectedBitmaps.removeAt(idx)
+                                        pdfResult = null
+                                    },
                                     modifier = Modifier
                                         .align(Alignment.TopEnd)
                                         .padding(2.dp)
@@ -339,7 +386,10 @@ fun ImageToPdfScreen(
                                 modifier = Modifier
                                     .weight(1f)
                                     .clip(RoundedCornerShape(12.dp))
-                                    .clickable { pageSize = id }
+                                    .clickable {
+                                        pageSize = id
+                                        pdfResult = null
+                                    }
                             ) {
                                 Text(
                                     text = label,
@@ -353,6 +403,16 @@ fun ImageToPdfScreen(
                         }
                     }
 
+                    if (saveError != null) {
+                        Spacer(modifier = Modifier.height(14.dp))
+                        Text(
+                            text = "Save failed: $saveError",
+                            color = Color(0xFFFF5252),
+                            fontSize = 13.sp,
+                            textAlign = TextAlign.Center
+                        )
+                    }
+
                     Spacer(modifier = Modifier.height(24.dp))
 
                     // Generation Stats
@@ -360,7 +420,7 @@ fun ImageToPdfScreen(
                         Surface(
                             shape = RoundedCornerShape(16.dp),
                             color = DarkSurfaceElevated,
-                            border = androidx.compose.foundation.BorderStroke(1.dp, NeonEmerald),
+                            border = BorderStroke(1.dp, NeonEmerald),
                             modifier = Modifier.fillMaxWidth()
                         ) {
                             Row(
@@ -373,7 +433,7 @@ fun ImageToPdfScreen(
                                 Column {
                                     Text("PDF READY", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = NeonEmerald)
                                     Text("${pdfResult!!.pageCount} Pages Generated", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = Color.White)
-                                    Text("${pdfResult!!.fileSizeBytes / 1024} KB", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    Text(AppLogger.formatBytes(pdfResult!!.fileSizeBytes), fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                 }
                                 Icon(Icons.Default.Check, contentDescription = null, tint = NeonEmerald, modifier = Modifier.size(28.dp))
                             }
@@ -385,6 +445,7 @@ fun ImageToPdfScreen(
                     if (pdfResult == null) {
                         Button(
                             onClick = { generatePdf() },
+                            enabled = !isGenerating,
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .height(54.dp)
@@ -392,24 +453,32 @@ fun ImageToPdfScreen(
                             shape = RoundedCornerShape(16.dp),
                             colors = ButtonDefaults.buttonColors(containerColor = ElectricCyan)
                         ) {
-                            Icon(Icons.Default.PictureAsPdf, contentDescription = null, tint = Color.Black, modifier = Modifier.size(20.dp))
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text("Generate PDF Document", color = Color.Black, fontWeight = FontWeight.Bold)
+                            if (isGenerating) {
+                                CircularProgressIndicator(color = Color.Black, modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text("Generating PDF...", color = Color.Black, fontWeight = FontWeight.Bold)
+                            } else {
+                                Icon(Icons.Default.PictureAsPdf, contentDescription = null, tint = Color.Black, modifier = Modifier.size(20.dp))
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text("Generate PDF Document", color = Color.Black, fontWeight = FontWeight.Bold)
+                            }
                         }
                     } else {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        Button(
+                            onClick = { performSave() },
+                            enabled = !isSaving,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(52.dp)
+                                .testTag("save_pdf_button"),
+                            shape = RoundedCornerShape(14.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = ElectricCyan)
                         ) {
-                            Button(
-                                onClick = { saveAndShare(share = false) },
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .height(52.dp)
-                                    .testTag("save_pdf_button"),
-                                shape = RoundedCornerShape(14.dp),
-                                colors = ButtonDefaults.buttonColors(containerColor = ElectricCyan)
-                            ) {
+                            if (isSaving) {
+                                CircularProgressIndicator(color = Color.Black, modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("Saving...", color = Color.Black, fontWeight = FontWeight.Bold)
+                            } else {
                                 Icon(
                                     imageVector = if (savedSuccess) Icons.Default.Check else Icons.Default.Download,
                                     contentDescription = null,
@@ -418,7 +487,7 @@ fun ImageToPdfScreen(
                                 )
                                 Spacer(modifier = Modifier.width(6.dp))
                                 Text(
-                                    text = if (savedSuccess) "Saved!" else "Save Project",
+                                    text = if (savedSuccess) "Saved to Downloads!" else "Save PDF to Downloads",
                                     color = Color.Black,
                                     fontWeight = FontWeight.Bold
                                 )
@@ -428,7 +497,7 @@ fun ImageToPdfScreen(
                         Spacer(modifier = Modifier.height(12.dp))
 
                         Button(
-                            onClick = { saveAndShare(share = true) },
+                            onClick = { performShare() },
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .height(52.dp),

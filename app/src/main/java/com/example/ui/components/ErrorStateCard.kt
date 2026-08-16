@@ -39,7 +39,7 @@ fun ErrorStateCard(
     errorMessage: String,
     onRetry: () -> Unit,
     onCancel: () -> Unit,
-    onReportProblem: () -> Unit,
+    onReportProblem: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     Surface(

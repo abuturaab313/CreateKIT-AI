@@ -1,8 +1,8 @@
 package com.example.ui.tools
 
-import android.content.Intent
 import android.graphics.Bitmap
 import android.net.Uri
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
@@ -30,17 +30,16 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.filled.AddPhotoAlternate
 import androidx.compose.material.icons.filled.AspectRatio
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -62,20 +61,19 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.core.content.FileProvider
 import com.example.data.model.ToolType
-import com.example.engine.ImageProcessor
 import com.example.engine.ResizeMode
+import com.example.engine.processor.AppLogger
+import com.example.engine.processor.MediaProcessor
+import com.example.engine.processor.MediaStorageManager
 import com.example.ui.MainViewModel
 import com.example.ui.components.GlassCard
 import com.example.ui.theme.DarkSurface
 import com.example.ui.theme.DarkSurfaceElevated
 import com.example.ui.theme.ElectricCyan
-import com.example.ui.theme.NeonAmber
 import com.example.ui.theme.NeonViolet
 import kotlinx.coroutines.launch
 import java.io.File
-import java.io.FileOutputStream
 
 data class DimensionPreset(
     val platform: String,
@@ -105,62 +103,96 @@ fun ResizeScreen(
         DimensionPreset("Facebook", "Cover Photo", 1640, 924, "16:9 Wide")
     )
 
+    var selectedInputUri by remember { mutableStateOf<Uri?>(null) }
     var originalBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var selectedPreset by remember { mutableStateOf(presets[0]) }
     var resizeMode by remember { mutableStateOf(ResizeMode.CROP) }
     var resizedBitmap by remember { mutableStateOf<Bitmap?>(null) }
+    var lastSavedFile by remember { mutableStateOf<File?>(null) }
+    var isSaving by remember { mutableStateOf(false) }
     var savedSuccess by remember { mutableStateOf(false) }
+    var saveError by remember { mutableStateOf<String?>(null) }
 
     val photoPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
     ) { uri: Uri? ->
         if (uri != null) {
+            selectedInputUri = uri
             resizedBitmap = null
+            lastSavedFile = null
             savedSuccess = false
-            originalBitmap = ImageProcessor.loadBitmapFromUri(context, uri, 3840)
+            saveError = null
+            val inputSize = MediaProcessor.image.getFileSizeFromUri(context, uri)
+            AppLogger.logStart("ResizeImage", uri.toString(), context.contentResolver.getType(uri), inputSize)
+            originalBitmap = MediaProcessor.image.loadBitmapFromUri(context, uri, 3840)
         }
     }
 
     fun executeResize() {
         val src = originalBitmap ?: return
-        val out = ImageProcessor.resizeImage(
+        AppLogger.logProcessing("ResizeImage", "MediaProcessor.image.resize", "${selectedPreset.width}x${selectedPreset.height} mode=$resizeMode")
+        val out = MediaProcessor.image.resize(
             src = src,
             targetWidth = selectedPreset.width,
             targetHeight = selectedPreset.height,
             mode = resizeMode
         )
         resizedBitmap = out
+        savedSuccess = false
+        saveError = null
+        AppLogger.logSuccess("ResizeImage", "Created bitmap: ${out.width}x${out.height}")
     }
 
-    fun saveAndShare(share: Boolean = false) {
+    fun performSave(onComplete: ((File?) -> Unit)? = null) {
         val result = resizedBitmap ?: return
+        isSaving = true
+        saveError = null
+
         scope.launch {
-            val exportDir = File(context.filesDir, "exports").apply { mkdirs() }
-            val exportFile = File(exportDir, "resized_${selectedPreset.width}x${selectedPreset.height}_${System.currentTimeMillis()}.jpg")
-            val fos = FileOutputStream(exportFile)
-            result.compress(Bitmap.CompressFormat.JPEG, 92, fos)
-            fos.flush()
-            fos.close()
-
-            viewModel.saveProject(
-                title = "${selectedPreset.platform} ${selectedPreset.label} (${selectedPreset.width}×${selectedPreset.height})",
-                tool = ToolType.RESIZE_TOOL,
-                outputFile = exportFile,
-                previewBitmap = result,
-                width = result.width,
-                height = result.height,
-                format = "JPG"
+            val title = "resized_${selectedPreset.platform.lowercase()}_${selectedPreset.width}x${selectedPreset.height}"
+            val saveResult = MediaStorageManager.saveBitmapToGallery(
+                context = context,
+                bitmap = result,
+                displayName = title,
+                format = Bitmap.CompressFormat.JPEG,
+                quality = 92
             )
-            savedSuccess = true
 
-            if (share) {
-                val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", exportFile)
-                val intent = Intent(Intent.ACTION_SEND).apply {
-                    type = "image/jpeg"
-                    putExtra(Intent.EXTRA_STREAM, uri)
-                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            if (saveResult.isSuccess) {
+                val (file, galleryUri) = saveResult.getOrThrow()
+                lastSavedFile = file
+                viewModel.saveProject(
+                    title = "${selectedPreset.platform} ${selectedPreset.label} (${selectedPreset.width}×${selectedPreset.height})",
+                    tool = ToolType.RESIZE_TOOL,
+                    outputFile = file,
+                    previewBitmap = result,
+                    width = result.width,
+                    height = result.height,
+                    format = "JPG"
+                )
+                savedSuccess = true
+                isSaving = false
+                Toast.makeText(context, "Saved to Gallery!", Toast.LENGTH_SHORT).show()
+                onComplete?.invoke(file)
+            } else {
+                val err = saveResult.exceptionOrNull()?.localizedMessage ?: "Failed to save image"
+                saveError = err
+                isSaving = false
+                Toast.makeText(context, "Save failed: $err", Toast.LENGTH_SHORT).show()
+                onComplete?.invoke(null)
+            }
+        }
+    }
+
+    fun performShare() {
+        val cachedFile = lastSavedFile
+        if (cachedFile != null && cachedFile.exists()) {
+            MediaStorageManager.shareMediaFile(context, cachedFile, "image/jpeg", "Share Resized Image")
+        } else {
+            performSave { file ->
+                if (file != null && file.exists()) {
+                    MediaStorageManager.shareMediaFile(context, file, "image/jpeg", "Share Resized Image")
                 }
-                context.startActivity(Intent.createChooser(intent, "Share Resized Image"))
             }
         }
     }
@@ -401,6 +433,16 @@ fun ResizeScreen(
                         }
                     }
 
+                    if (saveError != null) {
+                        Spacer(modifier = Modifier.height(14.dp))
+                        Text(
+                            text = "Save failed: $saveError",
+                            color = Color(0xFFFF5252),
+                            fontSize = 13.sp,
+                            textAlign = TextAlign.Center
+                        )
+                    }
+
                     Spacer(modifier = Modifier.height(24.dp))
 
                     // Actions
@@ -427,7 +469,8 @@ fun ResizeScreen(
                             horizontalArrangement = Arrangement.spacedBy(10.dp)
                         ) {
                             Button(
-                                onClick = { saveAndShare(share = false) },
+                                onClick = { performSave() },
+                                enabled = !isSaving,
                                 modifier = Modifier
                                     .weight(1f)
                                     .height(52.dp)
@@ -435,28 +478,35 @@ fun ResizeScreen(
                                 shape = RoundedCornerShape(14.dp),
                                 colors = ButtonDefaults.buttonColors(containerColor = ElectricCyan)
                             ) {
-                                Icon(
-                                    imageVector = if (savedSuccess) Icons.Default.Check else Icons.Default.Download,
-                                    contentDescription = null,
-                                    tint = Color.Black,
-                                    modifier = Modifier.size(18.dp)
-                                )
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text(
-                                    text = if (savedSuccess) "Saved!" else "Save Project",
-                                    color = Color.Black,
-                                    fontWeight = FontWeight.Bold
-                                )
+                                if (isSaving) {
+                                    CircularProgressIndicator(color = Color.Black, modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text("Saving...", color = Color.Black, fontWeight = FontWeight.Bold)
+                                } else {
+                                    Icon(
+                                        imageVector = if (savedSuccess) Icons.Default.Check else Icons.Default.Download,
+                                        contentDescription = null,
+                                        tint = Color.Black,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(
+                                        text = if (savedSuccess) "Saved!" else "Save to Gallery",
+                                        color = Color.Black,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
                             }
                         }
 
                         Spacer(modifier = Modifier.height(12.dp))
 
                         Button(
-                            onClick = { saveAndShare(share = true) },
+                            onClick = { performShare() },
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .height(52.dp),
+                                .height(52.dp)
+                                .testTag("share_resized_button"),
                             shape = RoundedCornerShape(14.dp),
                             colors = ButtonDefaults.buttonColors(containerColor = NeonViolet)
                         ) {
