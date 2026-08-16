@@ -7,12 +7,14 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.ColorMatrix
 import android.graphics.ColorMatrixColorFilter
+import android.graphics.ImageDecoder
 import android.graphics.Paint
 import android.graphics.PorterDuff
 import android.graphics.PorterDuffXfermode
 import android.graphics.Rect
 import android.graphics.RectF
 import android.net.Uri
+import android.os.Build
 import java.io.File
 import java.io.FileOutputStream
 import java.io.InputStream
@@ -59,29 +61,43 @@ object ImageProcessor {
 
     fun loadBitmapFromUri(context: Context, uri: Uri, maxDimension: Int = 2048): Bitmap? {
         return try {
-            val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-            var stream: InputStream? = context.contentResolver.openInputStream(uri)
-            BitmapFactory.decodeStream(stream, null, options)
-            stream?.close()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                val source = ImageDecoder.createSource(context.contentResolver, uri)
+                ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
+                    decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+                    decoder.isMutableRequired = true
+                    val size = info.size
+                    if (size.width > maxDimension || size.height > maxDimension) {
+                        val ratio = min(maxDimension.toFloat() / size.width, maxDimension.toFloat() / size.height)
+                        decoder.setTargetSize(
+                            (size.width * ratio).toInt().coerceAtLeast(1),
+                            (size.height * ratio).toInt().coerceAtLeast(1)
+                        )
+                    }
+                }
+            } else {
+                var inSampleSize = 1
+                context.contentResolver.openInputStream(uri)?.use { stream ->
+                    val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                    BitmapFactory.decodeStream(stream, null, options)
+                    if (options.outHeight > maxDimension || options.outWidth > maxDimension) {
+                        val halfHeight = options.outHeight / 2
+                        val halfWidth = options.outWidth / 2
+                        while ((halfHeight / inSampleSize) >= maxDimension || (halfWidth / inSampleSize) >= maxDimension) {
+                            inSampleSize *= 2
+                        }
+                    }
+                }
 
-            var inSampleSize = 1
-            if (options.outHeight > maxDimension || options.outWidth > maxDimension) {
-                val halfHeight = options.outHeight / 2
-                val halfWidth = options.outWidth / 2
-                while ((halfHeight / inSampleSize) >= maxDimension || (halfWidth / inSampleSize) >= maxDimension) {
-                    inSampleSize *= 2
+                val decodeOptions = BitmapFactory.Options().apply {
+                    this.inSampleSize = inSampleSize
+                    inPreferredConfig = Bitmap.Config.ARGB_8888
+                    inMutable = true
+                }
+                context.contentResolver.openInputStream(uri)?.use { stream ->
+                    BitmapFactory.decodeStream(stream, null, decodeOptions)
                 }
             }
-
-            val decodeOptions = BitmapFactory.Options().apply {
-                inSampleSize = inSampleSize
-                inPreferredConfig = Bitmap.Config.ARGB_8888
-                inMutable = true
-            }
-            stream = context.contentResolver.openInputStream(uri)
-            val bitmap = BitmapFactory.decodeStream(stream, null, decodeOptions)
-            stream?.close()
-            bitmap
         } catch (e: Exception) {
             e.printStackTrace()
             null
@@ -432,7 +448,8 @@ object ImageProcessor {
         quality: Int,
         maxWidth: Int,
         maxHeight: Int,
-        destFile: File
+        destFile: File,
+        originalSizeBytes: Long = 0L
     ): CompressionResult {
         var scaled = src
         val width = src.width
@@ -445,7 +462,7 @@ object ImageProcessor {
             scaled = Bitmap.createScaledBitmap(src, targetW, targetH, true)
         }
 
-        val originalBytes = (width * height * 4).toLong()
+        val originalBytes = if (originalSizeBytes > 0L) originalSizeBytes else (width * height * 4).toLong()
         val fos = FileOutputStream(destFile)
         scaled.compress(format, quality.coerceIn(1, 100), fos)
         fos.flush()

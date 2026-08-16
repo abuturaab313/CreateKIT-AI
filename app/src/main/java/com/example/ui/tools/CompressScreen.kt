@@ -67,6 +67,7 @@ import androidx.core.content.FileProvider
 import com.example.data.model.ToolType
 import com.example.engine.CompressionResult
 import com.example.engine.ImageProcessor
+import com.example.engine.processor.MediaProcessor
 import com.example.ui.MainViewModel
 import com.example.ui.components.GlassCard
 import com.example.ui.theme.DarkSurface
@@ -100,6 +101,7 @@ fun CompressScreen(
     val scope = rememberCoroutineScope()
 
     var originalBitmap by remember { mutableStateOf<Bitmap?>(null) }
+    var originalSizeBytes by remember { mutableStateOf(0L) }
     var selectedPreset by remember { mutableStateOf(CompressPreset.BALANCED) }
     var qualityVal by remember { mutableFloatStateOf(78f) }
     var selectedFormat by remember { mutableStateOf(OutputFormat.WEBP) }
@@ -114,7 +116,8 @@ fun CompressScreen(
         if (uri != null) {
             compressionResult = null
             savedSuccess = false
-            originalBitmap = ImageProcessor.loadBitmapFromUri(context, uri, 3840)
+            originalSizeBytes = MediaProcessor.image.getFileSizeFromUri(context, uri)
+            originalBitmap = MediaProcessor.image.loadBitmapFromUri(context, uri, 3840)
         }
     }
 
@@ -139,7 +142,8 @@ fun CompressScreen(
                 quality = qualityVal.toInt(),
                 maxWidth = selectedPreset.maxDim,
                 maxHeight = selectedPreset.maxDim,
-                destFile = exportFile
+                destFile = exportFile,
+                originalSizeBytes = originalSizeBytes
             )
 
             compressionResult = result

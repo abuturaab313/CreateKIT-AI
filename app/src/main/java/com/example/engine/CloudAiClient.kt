@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
+import com.example.engine.processor.MediaProcessor
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
@@ -30,20 +31,11 @@ class CloudAiClient(private val context: Context) {
     ): AiResult<Bitmap> = withContext(Dispatchers.IO) {
         val startTime = System.currentTimeMillis()
         try {
-            onProgress(0.15f, "Analyzing image luminance & details...")
-            delay(400)
-
-            onProgress(0.45f, "Applying ${mode.displayName} neural pipeline...")
-            delay(500)
-
-            onProgress(0.80f, "Reconstructing high-frequency textures...")
-            // Perform high-precision on-device neural-inspired filter
-            val enhanced = ImageProcessor.enhanceBitmap(bitmap, mode)
-            delay(300)
-
-            onProgress(1.0f, "Finishing render...")
+            onProgress(0.25f, "Applying ${mode.displayName} local enhancement pipeline...")
+            val enhanced = MediaProcessor.image.enhance(bitmap, mode)
             val latency = System.currentTimeMillis() - startTime
-            AiResult.Success(enhanced, "CreatorKit Neural Engine v2.6", latency)
+            onProgress(1.0f, "Render complete (${latency}ms)")
+            AiResult.Success(enhanced, "CreatorKit Engine", latency)
         } catch (e: Exception) {
             AiResult.Error(
                 message = "Enhancement couldn't be completed. Your original file is safe.",
@@ -63,24 +55,16 @@ class CloudAiClient(private val context: Context) {
     ): AiResult<Bitmap> = withContext(Dispatchers.IO) {
         val startTime = System.currentTimeMillis()
         try {
-            onProgress(0.2f, "Detecting subject silhouettes...")
-            delay(450)
-
-            onProgress(0.6f, "Refining boundary edges & alpha matte...")
-            delay(400)
-
-            onProgress(0.85f, "Synthesizing transparent layer...")
-            val result = ImageProcessor.removeBackground(
+            onProgress(0.35f, "Isolating foreground subject & alpha matte...")
+            val result = MediaProcessor.ai.removeBackground(
                 src = bitmap,
                 bgType = bgType,
                 solidColor = solidColor,
                 customBgBitmap = customBg,
-                feather = feather,
                 addShadow = addShadow
             )
-
-            onProgress(1.0f, "Complete!")
             val latency = System.currentTimeMillis() - startTime
+            onProgress(1.0f, "Complete (${latency}ms)")
             AiResult.Success(result, "Vision Segmentation Core", latency)
         } catch (e: Exception) {
             AiResult.Error(
@@ -97,19 +81,11 @@ class CloudAiClient(private val context: Context) {
     ): AiResult<Bitmap> = withContext(Dispatchers.IO) {
         val startTime = System.currentTimeMillis()
         try {
-            onProgress(0.2f, "Scanning brush mask boundaries...")
-            delay(400)
-
-            onProgress(0.55f, "Contextual inpainting & texture synthesis...")
-            delay(500)
-
-            onProgress(0.85f, "Blending ambient light and color...")
-            val infilled = ImageProcessor.removeObject(bitmap, maskBitmap)
-            delay(300)
-
-            onProgress(1.0f, "Render finished!")
+            onProgress(0.35f, "Inpainting brush mask region...")
+            val infilled = MediaProcessor.ai.removeObject(bitmap, maskBitmap)
             val latency = System.currentTimeMillis() - startTime
-            AiResult.Success(infilled, "CreatorKit Inpaint Engine", latency)
+            onProgress(1.0f, "Inpainting complete (${latency}ms)")
+            AiResult.Success(infilled, "Inpainting Engine", latency)
         } catch (e: Exception) {
             AiResult.Error(
                 message = "Object removal couldn't be completed. Your original file is safe.",
@@ -124,19 +100,11 @@ class CloudAiClient(private val context: Context) {
     ): AiResult<List<CaptionCue>> = withContext(Dispatchers.IO) {
         val startTime = System.currentTimeMillis()
         try {
-            onProgress(0.25f, "Extracting audio track & frequency spectrum...")
-            delay(400)
-
-            onProgress(0.65f, "Speech-to-text neural transcription...")
-            delay(600)
-
-            onProgress(0.90f, "Aligning word timestamps and keyword emphasis...")
+            onProgress(0.5f, "Aligning speech timestamps...")
             val cues = CaptionEngine.generateIntelligentCuesFromDuration(durationMs)
-            delay(200)
-
-            onProgress(1.0f, "Captions ready!")
             val latency = System.currentTimeMillis() - startTime
-            AiResult.Success(cues, "Whisper-Fast Speech Engine", latency)
+            onProgress(1.0f, "Captions ready (${latency}ms)")
+            AiResult.Success(cues, "Speech Timing Engine", latency)
         } catch (e: Exception) {
             AiResult.Error(
                 message = "Transcription couldn't be completed. Your original file is safe.",

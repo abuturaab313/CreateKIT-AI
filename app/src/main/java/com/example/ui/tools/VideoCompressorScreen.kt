@@ -4,6 +4,7 @@ import android.content.Intent
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -30,22 +31,26 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.ContentCut
 import androidx.compose.material.icons.filled.Download
-import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.VideoFile
 import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.RangeSlider
+import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -62,16 +67,17 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.FileProvider
 import com.example.data.model.ToolType
 import com.example.engine.VideoInfo
-import com.example.engine.VideoInspectorEngine
 import com.example.engine.VideoPreset
+import com.example.engine.processor.MediaProcessor
+import com.example.engine.processor.RealVideoProcessResult
 import com.example.ui.MainViewModel
 import com.example.ui.components.GlassCard
 import com.example.ui.theme.DarkSurface
 import com.example.ui.theme.DarkSurfaceElevated
 import com.example.ui.theme.ElectricCyan
-import com.example.ui.theme.NeonAmber
 import com.example.ui.theme.NeonEmerald
 import com.example.ui.theme.NeonViolet
 import kotlinx.coroutines.launch
@@ -88,6 +94,11 @@ fun VideoCompressorScreen(
     var selectedUri by remember { mutableStateOf<Uri?>(null) }
     var videoInfo by remember { mutableStateOf<VideoInfo?>(null) }
     var selectedPreset by remember { mutableStateOf(VideoPreset.WHATSAPP) }
+
+    var trimRange by remember { mutableStateOf(0f..10f) }
+    var isProcessing by remember { mutableStateOf(false) }
+    var processResult by remember { mutableStateOf<RealVideoProcessResult?>(null) }
+    var errorMessage by remember { mutableStateOf<String?>(null) }
     var savedSuccess by remember { mutableStateOf(false) }
 
     val videoPicker = rememberLauncherForActivityResult(
@@ -95,8 +106,15 @@ fun VideoCompressorScreen(
     ) { uri: Uri? ->
         if (uri != null) {
             selectedUri = uri
+            processResult = null
             savedSuccess = false
-            videoInfo = VideoInspectorEngine.inspectVideo(context, uri)
+            errorMessage = null
+            val info = MediaProcessor.video.inspect(context, uri)
+            videoInfo = info
+            if (info != null) {
+                val durSec = (info.durationMs / 1000f).coerceAtLeast(1f)
+                trimRange = 0f..durSec
+            }
         }
     }
 
@@ -109,32 +127,68 @@ fun VideoCompressorScreen(
         }
     }
 
-    fun saveReport() {
-        val info = videoInfo ?: return
-        scope.launch {
-            val estimatedBytes = VideoInspectorEngine.estimateCompressedSize(info.durationMs, selectedPreset)
-            val exportDir = File(context.filesDir, "exports").apply { mkdirs() }
-            val reportFile = File(exportDir, "video_spec_${System.currentTimeMillis()}.txt")
-            reportFile.writeText(
-                "CreatorKit AI - Video Compressor Spec Sheet\n" +
-                "Preset: ${selectedPreset.label}\n" +
-                "Target Resolution: ${selectedPreset.targetResolution}\n" +
-                "Target Bitrate: ${selectedPreset.targetBitrateKbps} kbps\n" +
-                "Original Size: ${formatBytes(info.fileSizeBytes)}\n" +
-                "Estimated Output: ${formatBytes(estimatedBytes)}\n" +
-                "Duration: ${info.durationMs / 1000}s\n"
-            )
+    fun formatSeconds(sec: Float): String {
+        val totalSec = sec.toInt()
+        val m = totalSec / 60
+        val s = totalSec % 60
+        return String.format("%02d:%02d", m, s)
+    }
 
+    fun startTrimAndExport() {
+        val uri = selectedUri ?: return
+        val info = videoInfo ?: return
+
+        isProcessing = true
+        errorMessage = null
+
+        scope.launch {
+            try {
+                val exportDir = MediaProcessor.getExportDirectory(context)
+                val exportFile = File(exportDir, "video_trimmed_${System.currentTimeMillis()}.mp4")
+
+                val startMs = (trimRange.start * 1000).toLong().coerceAtLeast(0L)
+                val endMs = (trimRange.endInclusive * 1000).toLong().coerceAtMost(info.durationMs)
+
+                val result = MediaProcessor.video.trimVideo(
+                    context = context,
+                    srcUri = uri,
+                    startMs = startMs,
+                    endMs = endMs,
+                    outputFile = exportFile
+                )
+
+                processResult = result
+                isProcessing = false
+            } catch (e: Exception) {
+                isProcessing = false
+                errorMessage = "Video processing failed: ${e.localizedMessage ?: "Format not supported"}"
+            }
+        }
+    }
+
+    fun saveToProjects(share: Boolean = false) {
+        val result = processResult ?: return
+        scope.launch {
             viewModel.saveProject(
-                title = "Video Spec (${selectedPreset.label})",
+                title = "Trimmed Video (${result.width}×${result.height})",
                 tool = ToolType.VIDEO_COMPRESSOR,
-                outputFile = reportFile,
-                previewBitmap = info.thumbnail,
-                width = info.width,
-                height = info.height,
+                outputFile = result.file,
+                previewBitmap = videoInfo?.thumbnail,
+                width = result.width,
+                height = result.height,
                 format = "MP4"
             )
             savedSuccess = true
+
+            if (share) {
+                val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", result.file)
+                val intent = Intent(Intent.ACTION_SEND).apply {
+                    type = "video/mp4"
+                    putExtra(Intent.EXTRA_STREAM, uri)
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+                context.startActivity(Intent.createChooser(intent, "Share Trimmed Video"))
+            }
         }
     }
 
@@ -170,7 +224,7 @@ fun VideoCompressorScreen(
                     }
                     Spacer(modifier = Modifier.width(8.dp))
                     Text(
-                        text = "Video Optimizer",
+                        text = "Video Trim & Compress",
                         fontSize = 19.sp,
                         fontWeight = FontWeight.Bold,
                         color = Color.White
@@ -179,7 +233,8 @@ fun VideoCompressorScreen(
 
                 if (videoInfo != null) {
                     TextButton(
-                        onClick = { videoPicker.launch("video/*") }
+                        onClick = { videoPicker.launch("video/*") },
+                        modifier = Modifier.testTag("video_change_button")
                     ) {
                         Text("Change", color = ElectricCyan)
                     }
@@ -228,14 +283,14 @@ fun VideoCompressorScreen(
                             }
                             Spacer(modifier = Modifier.height(16.dp))
                             Text(
-                                text = "Select Video to Optimize",
+                                text = "Select Video to Trim & Optimize",
                                 fontSize = 17.sp,
                                 fontWeight = FontWeight.Bold,
                                 color = Color.White
                             )
                             Spacer(modifier = Modifier.height(6.dp))
                             Text(
-                                text = "Compress for WhatsApp 16MB/64MB, Instagram Reels & YouTube Shorts",
+                                text = "Native hardware re-muxing for WhatsApp, Reels & YouTube Shorts",
                                 fontSize = 13.sp,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 textAlign = TextAlign.Center
@@ -244,9 +299,8 @@ fun VideoCompressorScreen(
                     }
                 } else {
                     val info = videoInfo!!
-                    val estimatedBytes = VideoInspectorEngine.estimateCompressedSize(info.durationMs, selectedPreset)
 
-                    // Video Thumbnail
+                    // Video Thumbnail Preview
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -273,7 +327,7 @@ fun VideoCompressorScreen(
                                 .padding(10.dp)
                         ) {
                             Text(
-                                text = "${info.width}×${info.height} • ${info.durationMs / 1000}s",
+                                text = "${info.width}×${info.height} • ${formatSeconds(info.durationMs / 1000f)}",
                                 color = Color.White,
                                 fontSize = 11.sp,
                                 fontWeight = FontWeight.Bold,
@@ -284,120 +338,210 @@ fun VideoCompressorScreen(
 
                     Spacer(modifier = Modifier.height(16.dp))
 
-                    // Size Comparison Card
+                    // Video Trimmer Controls
+                    val maxSec = (info.durationMs / 1000f).coerceAtLeast(1f)
                     Surface(
                         shape = RoundedCornerShape(16.dp),
                         color = DarkSurfaceElevated,
-                        border = androidx.compose.foundation.BorderStroke(1.dp, NeonEmerald.copy(alpha = 0.5f)),
                         modifier = Modifier.fillMaxWidth()
                     ) {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(16.dp),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Column {
-                                Text("ESTIMATED SIZE", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                Text(formatBytes(estimatedBytes), fontSize = 22.sp, fontWeight = FontWeight.Black, color = NeonEmerald)
-                                Text("Original: ${formatBytes(info.fileSizeBytes)}", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                            }
-
-                            val savedPct = ((info.fileSizeBytes - estimatedBytes).toFloat() / info.fileSizeBytes.coerceAtLeast(1) * 100f).coerceIn(0f, 90f)
-                            Surface(
-                                shape = RoundedCornerShape(12.dp),
-                                color = NeonEmerald.copy(alpha = 0.2f),
-                                border = androidx.compose.foundation.BorderStroke(1.dp, NeonEmerald)
+                        Column(modifier = Modifier.padding(16.dp)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
                             ) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Icon(Icons.Default.ContentCut, contentDescription = null, tint = ElectricCyan, modifier = Modifier.size(16.dp))
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text("TRIM SEGMENT", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                                }
                                 Text(
-                                    text = "-${savedPct.toInt()}% Ratio",
-                                    fontSize = 14.sp,
-                                    fontWeight = FontWeight.Black,
-                                    color = NeonEmerald,
-                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
+                                    text = "${formatSeconds(trimRange.start)} → ${formatSeconds(trimRange.endInclusive)} (${formatSeconds(trimRange.endInclusive - trimRange.start)})",
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = ElectricCyan
                                 )
                             }
+
+                            Spacer(modifier = Modifier.height(8.dp))
+
+                            RangeSlider(
+                                value = trimRange,
+                                onValueChange = { trimRange = it },
+                                valueRange = 0f..maxSec,
+                                colors = SliderDefaults.colors(
+                                    thumbColor = ElectricCyan,
+                                    activeTrackColor = ElectricCyan,
+                                    inactiveTrackColor = Color.DarkGray
+                                ),
+                                modifier = Modifier.testTag("video_trim_slider")
+                            )
                         }
                     }
 
-                    Spacer(modifier = Modifier.height(20.dp))
+                    Spacer(modifier = Modifier.height(16.dp))
 
-                    // Presets
-                    Text(
-                        text = "SELECT VIDEO PLATFORM PRESET",
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.align(Alignment.Start)
-                    )
-
-                    Spacer(modifier = Modifier.height(10.dp))
-
-                    LazyRow(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        items(VideoPreset.values()) { preset ->
-                            val isChosen = selectedPreset == preset
-                            Surface(
-                                shape = RoundedCornerShape(14.dp),
-                                color = if (isChosen) ElectricCyan else DarkSurfaceElevated,
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(14.dp))
-                                    .clickable { selectedPreset = preset }
-                                    .testTag("video_preset_${preset.name}")
-                            ) {
-                                Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
-                                    Text(
-                                        text = preset.label,
-                                        fontSize = 13.sp,
-                                        fontWeight = FontWeight.Bold,
-                                        color = if (isChosen) Color.Black else Color.White
-                                    )
-                                    Text(
-                                        text = "${preset.targetResolution} • ${preset.targetBitrateKbps} kbps",
-                                        fontSize = 11.sp,
-                                        color = if (isChosen) Color.Black.copy(alpha = 0.8f) else Color.LightGray
-                                    )
+                    // Result or Presets
+                    if (processResult != null) {
+                        val res = processResult!!
+                        Surface(
+                            shape = RoundedCornerShape(16.dp),
+                            color = DarkSurfaceElevated,
+                            border = BorderStroke(1.dp, NeonEmerald),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Column(modifier = Modifier.padding(16.dp)) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column {
+                                        Text("OUTPUT FILE READY", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = NeonEmerald)
+                                        Text(formatBytes(res.outputSizeBytes), fontSize = 22.sp, fontWeight = FontWeight.Black, color = Color.White)
+                                        Text("Duration: ${formatSeconds(res.outputDurationMs / 1000f)}", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    }
+                                    Surface(
+                                        shape = RoundedCornerShape(10.dp),
+                                        color = NeonEmerald.copy(alpha = 0.2f),
+                                        border = BorderStroke(1.dp, NeonEmerald)
+                                    ) {
+                                        Text(
+                                            text = "GENUINE MP4",
+                                            fontSize = 12.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            color = NeonEmerald,
+                                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                                        )
+                                    }
                                 }
                             }
                         }
-                    }
 
-                    Spacer(modifier = Modifier.height(10.dp))
+                        Spacer(modifier = Modifier.height(16.dp))
 
-                    Text(
-                        text = selectedPreset.description,
-                        fontSize = 12.sp,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.align(Alignment.Start)
-                    )
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            Button(
+                                onClick = { saveToProjects(share = false) },
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(52.dp)
+                                    .testTag("save_video_button"),
+                                shape = RoundedCornerShape(14.dp),
+                                colors = ButtonDefaults.buttonColors(containerColor = NeonEmerald)
+                            ) {
+                                Icon(
+                                    imageVector = if (savedSuccess) Icons.Default.Check else Icons.Default.Download,
+                                    contentDescription = null,
+                                    tint = Color.Black,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    text = if (savedSuccess) "Saved!" else "Save Project",
+                                    color = Color.Black,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
 
-                    Spacer(modifier = Modifier.height(24.dp))
-
-                    Button(
-                        onClick = { saveReport() },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(54.dp)
-                            .testTag("save_video_preset_button"),
-                        shape = RoundedCornerShape(16.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = ElectricCyan)
-                    ) {
-                        Icon(
-                            imageVector = if (savedSuccess) Icons.Default.Check else Icons.Default.Download,
-                            contentDescription = null,
-                            tint = Color.Black,
-                            modifier = Modifier.size(18.dp)
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
+                            Button(
+                                onClick = { saveToProjects(share = true) },
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(52.dp)
+                                    .testTag("share_video_button"),
+                                shape = RoundedCornerShape(14.dp),
+                                colors = ButtonDefaults.buttonColors(containerColor = NeonViolet)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Share,
+                                    contentDescription = null,
+                                    tint = Color.White,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("Share Video", color = Color.White, fontWeight = FontWeight.Bold)
+                            }
+                        }
+                    } else {
+                        // Presets
                         Text(
-                            text = if (savedSuccess) "Spec Sheet Saved to Projects!" else "Save Optimizer Profile",
-                            fontSize = 15.sp,
+                            text = "SELECT VIDEO PRESET",
+                            fontSize = 12.sp,
                             fontWeight = FontWeight.Bold,
-                            color = Color.Black
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.align(Alignment.Start)
                         )
+
+                        Spacer(modifier = Modifier.height(10.dp))
+
+                        LazyRow(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            items(VideoPreset.values()) { preset ->
+                                val isChosen = selectedPreset == preset
+                                Surface(
+                                    shape = RoundedCornerShape(14.dp),
+                                    color = if (isChosen) ElectricCyan else DarkSurfaceElevated,
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(14.dp))
+                                        .clickable { selectedPreset = preset }
+                                        .testTag("video_preset_${preset.name}")
+                                ) {
+                                    Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+                                        Text(
+                                            text = preset.label,
+                                            fontSize = 13.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            color = if (isChosen) Color.Black else Color.White
+                                        )
+                                        Text(
+                                            text = "${preset.targetResolution} • ${preset.targetBitrateKbps} kbps",
+                                            fontSize = 11.sp,
+                                            color = if (isChosen) Color.Black.copy(alpha = 0.8f) else Color.LightGray
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
+                        if (errorMessage != null) {
+                            Spacer(modifier = Modifier.height(12.dp))
+                            Text(
+                                text = errorMessage!!,
+                                color = Color(0xFFFF5252),
+                                fontSize = 13.sp,
+                                textAlign = TextAlign.Center
+                            )
+                        }
+
+                        Spacer(modifier = Modifier.height(24.dp))
+
+                        Button(
+                            onClick = { startTrimAndExport() },
+                            enabled = !isProcessing,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(54.dp)
+                                .testTag("trim_export_video_button"),
+                            shape = RoundedCornerShape(16.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = ElectricCyan)
+                        ) {
+                            if (isProcessing) {
+                                CircularProgressIndicator(color = Color.Black, modifier = Modifier.size(22.dp), strokeWidth = 2.dp)
+                                Spacer(modifier = Modifier.width(10.dp))
+                                Text("Trimming & Remuxing Video...", color = Color.Black, fontWeight = FontWeight.Bold)
+                            } else {
+                                Icon(Icons.Default.Movie, contentDescription = null, tint = Color.Black, modifier = Modifier.size(20.dp))
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text("Trim & Export Video (.mp4)", fontSize = 15.sp, fontWeight = FontWeight.Bold, color = Color.Black)
+                            }
+                        }
                     }
                 }
             }
