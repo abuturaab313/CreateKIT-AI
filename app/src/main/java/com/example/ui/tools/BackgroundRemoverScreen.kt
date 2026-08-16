@@ -73,6 +73,9 @@ import com.example.engine.processor.AppLogger
 import com.example.engine.processor.MediaProcessor
 import com.example.engine.processor.MediaStorageManager
 import com.example.ui.MainViewModel
+import com.example.ui.components.CheckerboardBackground
+import com.example.ui.components.DiagnosticInfo
+import com.example.ui.components.DiagnosticPanel
 import com.example.ui.components.CreditDialog
 import com.example.ui.components.ErrorStateCard
 import com.example.ui.components.GlassCard
@@ -110,6 +113,7 @@ fun BackgroundRemoverScreen(
     var lastSavedFile by remember { mutableStateOf<File?>(null) }
     var savedSuccess by remember { mutableStateOf(false) }
     var saveError by remember { mutableStateOf<String?>(null) }
+    var diagnosticInfo by remember { mutableStateOf(DiagnosticInfo()) }
 
     val photoPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
@@ -122,8 +126,18 @@ fun BackgroundRemoverScreen(
             savedSuccess = false
             saveError = null
             val inputSize = MediaProcessor.image.getFileSizeFromUri(context, uri)
-            AppLogger.logStart("RemoveBackground", uri.toString(), context.contentResolver.getType(uri), inputSize)
-            originalBitmap = MediaProcessor.image.loadBitmapFromUri(context, uri, 1920)
+            val mime = context.contentResolver.getType(uri) ?: "image/*"
+            AppLogger.logStart("RemoveBackground", uri.toString(), mime, inputSize)
+            val loaded = MediaProcessor.image.loadBitmapFromUri(context, uri, 1920)
+            originalBitmap = loaded
+            diagnosticInfo = DiagnosticInfo(
+                selectedUri = uri.toString(),
+                inputMime = mime,
+                inputSize = "${inputSize / 1024} KB",
+                inputDimensions = if (loaded != null) "${loaded.width}x${loaded.height}" else "Unknown",
+                processor = "CreatorKit Foreground Engine",
+                processingState = "Image Loaded"
+            )
         }
     }
 
@@ -175,13 +189,40 @@ fun BackgroundRemoverScreen(
             isProcessing = false
             when (result) {
                 is AiResult.Success -> {
-                    processedBitmap = result.data
+                    val bmp = result.data
+                    processedBitmap = bmp
                     savedSuccess = false
                     saveError = null
-                    AppLogger.logSuccess("RemoveBackground", "Segmented successfully (${result.latencyMs}ms)")
+
+                    // Verify alpha channel & transparent pixels count
+                    val hasAlpha = bmp.hasAlpha()
+                    var hasTransparentPixels = false
+                    val checkSampleStep = max(1, (bmp.width * bmp.height) / 1000)
+                    for (y in 0 until bmp.height step 10) {
+                        for (x in 0 until bmp.width step 10) {
+                            val pixel = bmp.getPixel(x, y)
+                            if (AndroidColor.alpha(pixel) < 50) {
+                                hasTransparentPixels = true
+                                break
+                            }
+                        }
+                        if (hasTransparentPixels) break
+                    }
+
+                    diagnosticInfo = diagnosticInfo.copy(
+                        processingState = "Completed (${result.latencyMs}ms)",
+                        outputDimensions = "${bmp.width}x${bmp.height}",
+                        outputMime = if (bgType == BgType.TRANSPARENT) "image/png" else "image/jpeg",
+                        hasAlpha = hasAlpha,
+                        transparentPixelsDetected = hasTransparentPixels,
+                        maskGenerated = true,
+                        alphaApplied = true
+                    )
+                    AppLogger.logSuccess("RemoveBackground", "Segmented successfully (${result.latencyMs}ms, hasAlpha=$hasAlpha, transparentPixels=$hasTransparentPixels)")
                 }
                 is AiResult.Error -> {
                     errorMessage = result.message
+                    diagnosticInfo = diagnosticInfo.copy(processingState = "Error: ${result.message}")
                     AppLogger.logFailed("RemoveBackground", RuntimeException(result.message))
                 }
             }
@@ -221,12 +262,18 @@ fun BackgroundRemoverScreen(
                 )
                 savedSuccess = true
                 isSaving = false
+                diagnosticInfo = diagnosticInfo.copy(
+                    outputUri = galleryUri.toString(),
+                    outputSize = "${file.length() / 1024} KB",
+                    saveStatus = "Saved to Gallery (${file.name})"
+                )
                 Toast.makeText(context, "Saved to Gallery!", Toast.LENGTH_SHORT).show()
                 onComplete?.invoke(file)
             } else {
                 val err = saveResult.exceptionOrNull()?.localizedMessage ?: "Failed to save image"
                 saveError = err
                 isSaving = false
+                diagnosticInfo = diagnosticInfo.copy(saveStatus = "Failed: $err")
                 Toast.makeText(context, "Save failed: $err", Toast.LENGTH_SHORT).show()
                 onComplete?.invoke(null)
             }
@@ -239,10 +286,12 @@ fun BackgroundRemoverScreen(
         val mime = if (isTransparent) "image/png" else "image/jpeg"
 
         if (cachedFile != null && cachedFile.exists()) {
+            diagnosticInfo = diagnosticInfo.copy(shareStatus = "Shared existing file")
             MediaStorageManager.shareMediaFile(context, cachedFile, mime, "Share Cutout")
         } else {
             performSave { file ->
                 if (file != null && file.exists()) {
+                    diagnosticInfo = diagnosticInfo.copy(shareStatus = "Exported & Shared file")
                     MediaStorageManager.shareMediaFile(context, file, mime, "Share Cutout")
                 }
             }
@@ -357,14 +406,24 @@ fun BackgroundRemoverScreen(
                 } else {
                     // Preview Frame
                     val aspect = (originalBitmap!!.width.toFloat() / originalBitmap!!.height.coerceAtLeast(1).toFloat()).coerceIn(0.6f, 2.2f)
+                    val showCheckerboard = (bgType == BgType.TRANSPARENT)
+
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
                             .aspectRatio(aspect)
-                            .clip(RoundedCornerShape(20.dp))
-                            .background(DarkSurface),
+                            .clip(RoundedCornerShape(20.dp)),
                         contentAlignment = Alignment.Center
                     ) {
+                        if (showCheckerboard) {
+                            CheckerboardBackground(
+                                modifier = Modifier.fillMaxSize(),
+                                squareSize = 12.dp
+                            )
+                        } else {
+                            Box(modifier = Modifier.fillMaxSize().background(DarkSurface))
+                        }
+
                         val displayBmp = processedBitmap ?: originalBitmap
                         if (displayBmp != null) {
                             Image(
@@ -533,6 +592,10 @@ fun BackgroundRemoverScreen(
                             textAlign = TextAlign.Center
                         )
                     }
+
+                    Spacer(modifier = Modifier.height(16.dp))
+
+                    DiagnosticPanel(info = diagnosticInfo)
 
                     Spacer(modifier = Modifier.height(20.dp))
 

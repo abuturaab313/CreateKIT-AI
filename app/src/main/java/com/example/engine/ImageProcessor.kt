@@ -264,6 +264,19 @@ object ImageProcessor {
         addShadow: Boolean = false,
         blurBg: Boolean = false
     ): Bitmap {
+        return com.example.engine.processor.MediaProcessor.ai.removeBackground(
+            src = src,
+            bgType = bgType,
+            solidColor = solidColor,
+            customBgBitmap = customBgBitmap,
+            addShadow = addShadow
+        )
+    }
+
+    private fun removeBackgroundOld() {
+    }
+
+    private fun dummyOld(
         val width = src.width
         val height = src.height
         val pixels = IntArray(width * height)

@@ -706,65 +706,157 @@ object AiSubProcessor {
     ): Bitmap {
         val width = src.width
         val height = src.height
-        val pixels = IntArray(width * height)
+        val totalPixels = width * height
+        val pixels = IntArray(totalPixels)
         src.getPixels(pixels, 0, width, 0, 0, width, height)
 
+        // 1. Multi-cluster background perimeter sampling
         val borderColors = mutableListOf<Int>()
-        for (x in 0 until width step max(1, width / 20)) {
+        val stepX = max(1, width / 40)
+        val stepY = max(1, height / 40)
+
+        for (x in 0 until width step stepX) {
             borderColors.add(pixels[x])
             borderColors.add(pixels[(height - 1) * width + x])
         }
-        for (y in 0 until height step max(1, height / 20)) {
+        for (y in 0 until height step stepY) {
             borderColors.add(pixels[y * width])
             borderColors.add(pixels[y * width + (width - 1)])
         }
 
-        var avgR = 0L
-        var avgG = 0L
-        var avgB = 0L
-        for (c in borderColors) {
-            avgR += Color.red(c)
-            avgG += Color.green(c)
-            avgB += Color.blue(c)
+        // Corner 8x8 blocks
+        val cornerSize = min(16, min(width, height) / 8)
+        for (cy in 0 until cornerSize) {
+            for (cx in 0 until cornerSize) {
+                borderColors.add(pixels[cy * width + cx])
+                borderColors.add(pixels[cy * width + (width - 1 - cx)])
+                borderColors.add(pixels[(height - 1 - cy) * width + cx])
+                borderColors.add(pixels[(height - 1 - cy) * width + (width - 1 - cx)])
+            }
         }
-        val count = borderColors.size.coerceAtLeast(1)
-        val bgR = (avgR / count).toInt()
-        val bgG = (avgG / count).toInt()
-        val bgB = (avgB / count).toInt()
 
-        val mask = BooleanArray(width * height)
-        val centerX = width / 2f
-        val centerY = height / 2f
+        // Build 3 dominant background color clusters (e.g. sky/wall/ground)
+        val bgClusters = mutableListOf<Triple<Float, Float, Float>>()
+        if (borderColors.isNotEmpty()) {
+            val step = max(1, borderColors.size / 6)
+            for (i in 0 until borderColors.size step step) {
+                val c = borderColors[i]
+                bgClusters.add(Triple(Color.red(c).toFloat(), Color.green(c).toFloat(), Color.blue(c).toFloat()))
+            }
+        }
+        if (bgClusters.isEmpty()) {
+            bgClusters.add(Triple(255f, 255f, 255f))
+        }
+
+        // 2. Probability and Saliency Map
+        val probMap = FloatArray(totalPixels)
+        val centerX = width * 0.5f
+        val centerY = height * 0.45f
         val maxDist = sqrt(centerX * centerX + centerY * centerY)
 
         for (y in 0 until height) {
+            val yOffset = y * width
             for (x in 0 until width) {
-                val idx = y * width + x
+                val idx = yOffset + x
                 val c = pixels[idx]
-                val r = Color.red(c)
-                val g = Color.green(c)
-                val b = Color.blue(c)
+                val r = Color.red(c).toFloat()
+                val g = Color.green(c).toFloat()
+                val b = Color.blue(c).toFloat()
 
-                val colorDiff = sqrt(
-                    ((r - bgR) * (r - bgR) + (g - bgG) * (g - bgG) + (b - bgB) * (b - bgB)).toDouble()
-                )
+                // Minimum distance to background color clusters
+                var minBgDist = Float.MAX_VALUE
+                for (cluster in bgClusters) {
+                    val dr = r - cluster.first
+                    val dg = g - cluster.second
+                    val db = b - cluster.third
+                    val dist = sqrt(dr * dr + dg * dg + db * db)
+                    if (dist < minBgDist) minBgDist = dist
+                }
 
-                val distFromCenter = sqrt(((x - centerX) * (x - centerX) + (y - centerY) * (y - centerY)).toDouble())
-                val centerWeight = 1.0 - (distFromCenter / maxDist) * 0.45
+                // YCbCr Skin Tone Prior
+                val yVal = 0.299f * r + 0.587f * g + 0.114f * b
+                val cb = 128f - 0.168736f * r - 0.331264f * g + 0.5f * b
+                val cr = 128f + 0.5f * r - 0.418688f * g - 0.081312f * b
+                val isSkin = (cb in 75f..135f) && (cr in 130f..180f) && (yVal in 30f..245f)
 
-                val isForeground = colorDiff > 42.0 || (centerWeight > 0.72 && colorDiff > 25.0)
-                mask[idx] = isForeground
+                // Spatial Saliency Weight (Central Human Silhouette Prior)
+                val dx = (x - centerX) / (width * 0.38f)
+                val dy = (y - centerY) / (height * 0.42f)
+                val spatialPrior = exp(-(dx * dx + dy * dy) * 0.7f).toFloat().coerceIn(0f, 1f)
+
+                // Contrast & Foreground Score
+                var score = (minBgDist / 70f).coerceIn(0f, 1f)
+                if (isSkin) {
+                    score = max(score, 0.88f)
+                }
+                score = (score * 0.65f + spatialPrior * 0.35f).coerceIn(0f, 1f)
+                probMap[idx] = score
             }
         }
 
-        val fgPixels = IntArray(width * height)
-        for (i in 0 until width * height) {
-            if (mask[i]) {
-                fgPixels[i] = pixels[i]
+        // 3. Flood-fill from borders to detect outer connected background
+        val isOuterBg = BooleanArray(totalPixels)
+        val queue: java.util.ArrayDeque<Int> = java.util.ArrayDeque(width * 2 + height * 2)
+
+        for (x in 0 until width) {
+            if (probMap[x] < 0.45f) { isOuterBg[x] = true; queue.add(x) }
+            val bIdx = (height - 1) * width + x
+            if (probMap[bIdx] < 0.45f) { isOuterBg[bIdx] = true; queue.add(bIdx) }
+        }
+        for (y in 0 until height) {
+            val lIdx = y * width
+            if (probMap[lIdx] < 0.45f) { isOuterBg[lIdx] = true; queue.add(lIdx) }
+            val rIdx = y * width + (width - 1)
+            if (probMap[rIdx] < 0.45f) { isOuterBg[rIdx] = true; queue.add(rIdx) }
+        }
+
+        while (!queue.isEmpty()) {
+            val curr = queue.poll() ?: continue
+            val cx = curr % width
+            val cy = curr / width
+
+            val neighbors = intArrayOf(
+                if (cx > 0) curr - 1 else -1,
+                if (cx < width - 1) curr + 1 else -1,
+                if (cy > 0) curr - width else -1,
+                if (cy < height - 1) curr + width else -1
+            )
+            for (n in neighbors) {
+                if (n != -1 && !isOuterBg[n] && probMap[n] < 0.52f) {
+                    isOuterBg[n] = true
+                    queue.add(n)
+                }
+            }
+        }
+
+        // 4. Alpha Matte Generation with Smooth Feathering & Hole-filling
+        val alphaMatte = IntArray(totalPixels)
+        for (i in 0 until totalPixels) {
+            if (isOuterBg[i]) {
+                alphaMatte[i] = 0
             } else {
-                fgPixels[i] = Color.TRANSPARENT
+                val p = probMap[i]
+                if (p > 0.60f) {
+                    alphaMatte[i] = 255
+                } else if (p < 0.25f) {
+                    alphaMatte[i] = 0
+                } else {
+                    alphaMatte[i] = ((p - 0.25f) / 0.35f * 255f).toInt().coerceIn(0, 255)
+                }
             }
         }
+
+        // 5. Alpha Compositing: Preserve 100% of the original RGB colors
+        val fgPixels = IntArray(totalPixels)
+        for (i in 0 until totalPixels) {
+            val orig = pixels[i]
+            val r = Color.red(orig)
+            val g = Color.green(orig)
+            val b = Color.blue(orig)
+            val a = alphaMatte[i]
+            fgPixels[i] = Color.argb(a, r, g, b)
+        }
+
         val fgBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         fgBitmap.setPixels(fgPixels, 0, width, 0, 0, width, height)
 
@@ -773,7 +865,9 @@ object AiSubProcessor {
         val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
 
         when (bgType) {
-            BgType.TRANSPARENT -> {}
+            BgType.TRANSPARENT -> {
+                // Keep pure RGBA transparent bitmap
+            }
             BgType.WHITE -> canvas.drawColor(Color.WHITE)
             BgType.BLACK -> canvas.drawColor(Color.BLACK)
             BgType.CUSTOM_COLOR -> canvas.drawColor(solidColor)
@@ -788,18 +882,18 @@ object AiSubProcessor {
             }
         }
 
-        if (addShadow) {
+        if (addShadow && bgType != BgType.TRANSPARENT) {
             val shadowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                 colorFilter = ColorMatrixColorFilter(
                     floatArrayOf(
                         0f, 0f, 0f, 0f, 0f,
                         0f, 0f, 0f, 0f, 0f,
                         0f, 0f, 0f, 0f, 0f,
-                        0f, 0f, 0f, 0.45f, 0f
+                        0f, 0f, 0f, 0.40f, 0f
                     )
                 )
             }
-            canvas.drawBitmap(fgBitmap, 12f, 18f, shadowPaint)
+            canvas.drawBitmap(fgBitmap, 10f, 16f, shadowPaint)
         }
 
         canvas.drawBitmap(fgBitmap, 0f, 0f, paint)
